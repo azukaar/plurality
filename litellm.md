@@ -70,15 +70,33 @@ api_key: "os.environ/CHATGPT_API_KEY"
 
 The proxy resolves it once at config load. The current providers and their env vars:
 
-| Provider     | `litellm_params.model` prefix | Env var            |
-| ------------ | ----------------------------- | ------------------ |
-| OpenAI       | _(none — bare name)_          | `CHATGPT_API_KEY`  |
-| Anthropic    | `anthropic/`                  | `CLAUDE_API_KEY`   |
-| Google       | `gemini/`                     | `GOOGLE_API_KEY`   |
-| Fireworks    | `fireworks_ai/`               | `FIREWORK_KEY`     |
-| Together     | `together_ai/`                | `TOGETHER_API_KEY` |
+| Provider        | `litellm_params.model` prefix | Env var              |
+| --------------- | ----------------------------- | -------------------- |
+| OpenAI          | _(none — bare name)_          | `CHATGPT_API_KEY`    |
+| Anthropic       | `anthropic/`                  | `CLAUDE_API_KEY`     |
+| Google          | `gemini/`                     | `GOOGLE_API_KEY`     |
+| OpenRouter      | `openrouter/`                 | `OPENROUTER_API_KEY` |
+| Fireworks       | `fireworks_ai/`               | `FIREWORK_KEY`       |
+| Together        | `together_ai/`                | `TOGETHER_API_KEY`   |
+| IO Intelligence | `openai/` + `api_base`        | `IONET_API_KEY`      |
 
 Set these in `server/.env` (loaded via `godotenv` at startup) or in the shell before running the server.
+
+IO Intelligence (io.net) is an OpenAI-compatible endpoint, so entries use the `openai/` prefix plus an explicit `api_base` — the model id after the prefix is the upstream `org/name` id (e.g. `openai/meta-llama/Llama-3.3-70B-Instruct`):
+
+```yaml
+- model_name: "llama-3.3-70b"
+  litellm_params:
+    model: "openai/meta-llama/Llama-3.3-70B-Instruct"
+    api_key: "os.environ/IONET_API_KEY"
+    api_base: "https://api.intelligence.io.solutions/api/v1"
+  model_info:
+    mode: "chat"
+    supports_vision: false
+    supports_function_calling: true
+```
+
+Access tiers: io.net's catalog flags some models as `higher_tier_required` — at the time of writing `zai-org/GLM-5.3` and `deepseek-ai/DeepSeek-R1-0528` need an io.net access tier above basic, while `meta-llama/Llama-3.3-70B-Instruct` works on the basic tier. A key without the required tier gets an authentication/permission error from io.net itself.
 
 ## Image gen, TTS, and STT — passthrough mode
 
