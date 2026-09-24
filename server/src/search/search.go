@@ -34,7 +34,24 @@ type SearchResult struct {
 }
 
 // Search runs a hybrid search combining FTS5 (BM25) and vector (KNN) results via RRF.
+// The embedding HTTP round-trip to LiteLLM happens FIRST, before any DB lock
+// is taken, so a slow/stuck embedding call can never hold the global SQLite
+// write lock (historically both callers wrapped the whole Search in
+// db.LockDBWrite()). Callers that want to serialize the DB part should generate
+// the embedding themselves and call SearchWithVec inside the lock.
 func Search(ctx context.Context, db *sql.DB, liteLLMBaseURL string, query string, limit int) ([]SearchResult, error) {
+	var queryVec []float32
+	if liteLLMBaseURL != "" {
+		queryVec, _ = GenerateEmbedding(liteLLMBaseURL, query)
+	}
+	return SearchWithVec(db, query, queryVec, limit)
+}
+
+// SearchWithVec is the DB-only half of Search: FTS5 + vec0 KNN + RRF merge +
+// enrichment. It performs NO HTTP and is safe to call while holding
+// db.LockDBWrite() or without it (the driver serializes the single SQLite
+// connection either way). A nil/empty queryVec simply skips the vector leg.
+func SearchWithVec(db *sql.DB, query string, queryVec []float32, limit int) ([]SearchResult, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -47,19 +64,14 @@ func Search(ctx context.Context, db *sql.DB, liteLLMBaseURL string, query string
 	}
 	utils.Debug("[Search] query=%q fts_results=%d", query, len(ftsResults))
 
-	// Run vector search (if embeddings API is available)
+	// Run vector search (if an embedding is available)
 	var vecResults []ScoredResult
-	if liteLLMBaseURL != "" {
-		queryVec, err := GenerateEmbedding(liteLLMBaseURL, query)
+	if len(queryVec) > 0 {
+		vecHits, err := VectorSearch(db, queryVec, "message", limit*2)
 		if err != nil {
-			utils.Debug("[Search] Embedding generation error: %v", err)
+			utils.Debug("[Search] Vector search error: %v", err)
 		} else {
-			vecHits, err := VectorSearch(db, queryVec, "message", limit*2)
-			if err != nil {
-				utils.Debug("[Search] Vector search error: %v", err)
-			} else {
-				vecResults = resolveMessageConversations(db, vecHits)
-			}
+			vecResults = resolveMessageConversations(db, vecHits)
 		}
 	}
 	utils.Debug("[Search] vec_results=%d", len(vecResults))

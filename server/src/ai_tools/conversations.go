@@ -49,8 +49,16 @@ var SearchConversationsTool = utils.AITool{
 			return utils.NewTextContent(fmt.Sprintf("Error: %v", err))
 		}
 
+		// Generate the embedding (HTTP to LiteLLM) OUTSIDE the SQLite write
+		// lock — a slow embedding response used to hold db.LockDBWrite() for
+		// its whole round-trip, wedging every PushMessage/eco writer and
+		// eventually killing the server right when a workflow ends.
+		var queryVec []float32
+		if db.LiteLLMBaseURL != "" {
+			queryVec, _ = search.GenerateEmbedding(db.LiteLLMBaseURL, query)
+		}
 		db.LockDBWrite()
-		results, err := search.Search(ctx, userDB, db.LiteLLMBaseURL, query, 10)
+		results, err := search.SearchWithVec(userDB, query, queryVec, 10)
 		db.UnlockDBWrite()
 		if err != nil {
 			return utils.NewTextContent(fmt.Sprintf("Error searching: %v", err))

@@ -79,15 +79,16 @@ func GetCheckpoint(ctx context.Context, conversationID string) (*CheckpointPair,
 		return nil, err
 	}
 
-	// Hold DBWriteMu across the SQLite reads here: they run on the same
-	// user DB and can overlap the async embed goroutine's vec0 INSERT (which
-	// also holds DBWriteMu) on the single native SQLite connection. A read
-	// overlapping a vec0/FTS5 write in native C aborts the process with no
-	// recoverable panic (see DBWriteMu). This read runs at eco-compaction
-	// time — exactly when the crash was observed.
-	DBWriteMu.Lock()
-	stampDBActivity()
-	defer DBWriteMu.Unlock()
+	// NOTE: deliberately NO DBWriteMu here. This is a pure SELECT; SQLite WAL
+	// allows concurrent readers, and the native C hazard (FTS5/vec0) only
+	// exists for WRITES. Taking the write lock around a read that then waits
+	// on the single pooled connection (SetMaxOpenConns(1)) is a deadlock: the
+	// reader holding the connection cannot finish because the eco goroutine is
+	// waiting for it while ALSO holding DBWriteMu, and every writer (PushMessage,
+	// ReplaceCheckpoint) waits on DBWriteMu forever. This read runs at
+	// eco-compaction time — exactly the crash observed. The native vec0/FTS5
+	// read overlap concern is handled by the driver's single-connection
+	// serialization, not by this lock.
 
 	// Find the assistant row. The tool_calls column is a JSON array; the
 	// LIKE filter is a cheap pre-filter, the canonical check happens after
@@ -182,12 +183,9 @@ func MessageSeqAt(ctx context.Context, conversationID string, sliceOffset int) (
 		return 0, err
 	}
 
-	// Serialize this SQLite read against the async embed's vec0 INSERT on
-	// the same user DB (see DBWriteMu) — a native read/write overlap aborts
-	// the process.
-	DBWriteMu.Lock()
-	stampDBActivity()
-	defer DBWriteMu.Unlock()
+	// Pure SELECT — see GetCheckpoint: no DBWriteMu on reads. Holding the
+	// write lock while waiting on the single pooled connection deadlocks the
+	// server at eco-compaction time (the observed crash).
 
 	var seq int64
 	err = d.QueryRowContext(ctx,

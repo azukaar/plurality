@@ -288,8 +288,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Generate the embedding (HTTP to LiteLLM) OUTSIDE the SQLite write lock —
+	// see search.Search: a stuck embedding used to hold LockDBWrite for its
+	// whole round-trip, blocking every writer and crashing the server.
+	var queryVec []float32
+	if ai.LiteLLMBaseURL != "" {
+		queryVec, _ = search.GenerateEmbedding(ai.LiteLLMBaseURL, query)
+	}
 	db.LockDBWrite()
-	results, err := search.Search(r.Context(), userDB, ai.LiteLLMBaseURL, query, limit)
+	results, err := search.SearchWithVec(userDB, query, queryVec, limit)
 	db.UnlockDBWrite()
 	if err != nil {
 		utils.SendHTTPError(w, err.Error(), http.StatusInternalServerError)
