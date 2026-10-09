@@ -82,6 +82,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
 	source_id   TEXT NOT NULL,
 	embedding   float[1536] distance_metric=cosine
 );
+
+-- Clean up embeddings when a message is deleted (parity with messages_fts_delete).
+-- Previously there was no trigger, so deleting a message left a dangling vector
+-- that permanently occupied ~6KB in the vec_embeddings shadow tables.
+CREATE TRIGGER IF NOT EXISTS messages_vec_delete AFTER DELETE ON messages
+BEGIN
+	DELETE FROM vec_embeddings WHERE source_type = 'message' AND source_id = CAST(OLD.id AS TEXT);
+END;
 `
 
 // InitSQLite reads the USER_DATA_STORAGE env var (default "./users-data"
@@ -142,6 +150,12 @@ func GetUserDB(userID string) (*sql.DB, error) {
 	if err := ensureColumn(db, "messages", "response_cost", "REAL DEFAULT 0"); err != nil {
 		utils.Error("[SQLite] migration response_cost failed", err)
 	}
+
+	// Best-effort storage maintenance: truncate oversized stored message
+	// blobs (legacy rows persisted before eco/compaction truncated them in
+	// memory), drop orphaned embeddings, and rebuild the FTS index. Runs
+	// once per process per user on first open. Never blocks startup.
+	RunStorageMaintenance(db)
 
 	actual, _ := userDBs.LoadOrStore(userID, db)
 	if actual.(*sql.DB) != db {

@@ -71,6 +71,7 @@ var NotifyTool = utils.AITool{
 					"tags": {
 						Type:        "array",
 						Description: "Optional list of NTFY tag shortcodes that render as emoji prefixes (e.g. [\"white_check_mark\"], [\"warning\"]).",
+						Items:       &utils.PropertyParameterToolsRequest{Type: "string", Description: "NTFY tag shortcode."},
 					},
 					"call": {
 						Type:        "string",

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -112,7 +111,7 @@ func searchNewsFromSources(keyword string, country string, language string) []Ne
 	}
 
 	// Make the API request
-	response, err := http.Get(apiURL)
+	response, err := utils.HTTPClient.Get(apiURL)
 	if err != nil {
 		utils.Error("Error making API request", err)
 		return []NewsArticle{}

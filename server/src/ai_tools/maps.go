@@ -106,7 +106,7 @@ var PlaceSearchTool = utils.AITool{
 		req.Header.Set("X-Goog-FieldMask", "places.displayName,places.formattedAddress,places.location,places.rating,places.types,places.priceLevel,places.websiteUri,places.id")
 
 		// Make the request
-		client := &http.Client{}
+		client := utils.HTTPClient
 		resp, err := client.Do(req)
 		if err != nil {
 			return utils.NewTextContent(fmt.Sprintf("Error making place search request: %s", err.Error()))

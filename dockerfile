@@ -66,8 +66,26 @@ WORKDIR /app/server
 
 # Build the Go application (build.sh sets its own CGO_CFLAGS).
 # GOOS/GOARCH come from buildx's per-target args.
+# CACHEBUST: pass --build-arg CACHEBUST=<git rev> so the Go binary is always
+# recompiled from the current source (prevents a stale cached 'go build' from
+# shipping an old server binary even when the checkout is up to date).
+ARG CACHEBUST=latest
 RUN chmod +x build.sh
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh
+
+# The RUN command below LITERALLY references ${CACHEBUST} so a changed
+# build-arg value changes the RUN instruction's command string and
+# therefore INVALIDATES the layer cache. A bare `ARG CACHEBUST` with no
+# reference does NOT bust anything (Docker only invalidates from the
+# first USE of the arg) -- that was the bug: CI passed CACHEBUST=<sha>
+# but the go build layer was served from cache, so the image shipped a
+# STALE binary built from an old checkout (observed: `latest` image
+# built from #49 still contained the Sep-30 19:28 binary with none of
+# the #37-#49 fixes).
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    echo "Building Plurality server @ CACHEBUST=${CACHEBUST}" && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh
+
 
 # Copy litellm requirements for installation in final stage
 RUN mkdir -p build/litellm && cp litellm_requirements.txt build/litellm/
@@ -117,10 +135,16 @@ COPY --from=flutter_builder /app/client/build/web /app/web
 # Create directories for volumes
 RUN mkdir -p /app/users-data /app/data
 
-# Declare volumes
+# Declare runtime data volumes. These are ALWAYS explicitly mounted by the
+# host/compose (see deployment.md) â do NOT add anonymous VOLUME entries here:
+# a VOLUME /root (or any dir that holds build tooling / binaries) makes Docker
+# create a persistent anonymous volume that SHADOWS that path on every
+# container start. A stale anonymous volume survives image rebuilds, so a
+# freshly layered binary can be masked by an old one from a previous
+# container, and /root tooling (go cache, npx, playwright) silently drifts.
+# Data dirs only, declared, not materialized.
 VOLUME /app/users-data
 VOLUME /app/data
-VOLUME /root
 
 # Expose the port the server listens on
 EXPOSE 8090
@@ -128,3 +152,10 @@ EXPOSE 8090
 # Run the server under tini so PID 1 reaps zombies and forwards signals
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/Plurality"]
+
+# Healthcheck for orchestrators / autoheal watchers (e.g. willfarrell/autoheal),
+# which restart any container lacking a HEALTHCHECK every cycle. The server
+# exposes /health (returns 200 when the HTTP stack is up), so a healthy HTTP
+# endpoint is the correct liveness signal. 20s interval, 3 retries, 5s timeout.
+HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1 || exit 1

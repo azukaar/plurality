@@ -181,6 +181,20 @@ func (r *activeRequestRegistry) Set(conversationID string, ar *ActiveRequest) {
 	r.requests[conversationID] = ar
 }
 
+// SetIfAbsent registers an ActiveRequest only if none is currently registered
+// for the conversation. Returns true when this call won the slot. Used by the
+// client-tool stall watchdog to atomically claim the resume — two watchdogs
+// racing for the same conversation can never both relaunch the loop.
+func (r *activeRequestRegistry) SetIfAbsent(conversationID string, ar *ActiveRequest) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.requests[conversationID] != nil {
+		return false
+	}
+	r.requests[conversationID] = ar
+	return true
+}
+
 // Remove unregisters an ActiveRequest for a conversation.
 func (r *activeRequestRegistry) Remove(conversationID string) {
 	r.mu.Lock()

@@ -3,11 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
+	"sync/atomic"
+	"time"
 
 	"github.com/azukaar/plurality/src/ai"
 	"github.com/azukaar/plurality/src/ai_tools"
@@ -42,6 +47,10 @@ func main() {
 	startup.Run()
 	db.InitSQLite()
 	defer db.CloseAllUserDBs()
+	// Single serialized embedding worker — without it, every message push
+	// spawns a goroutine that queues on the SetMaxOpenConns(1) SQLite pool
+	// and wedges the backend under load (see search/search.go).
+	search.InitEmbedWorker()
 	storage.Init()
 
 	// Load global server-side skills from data/skills/ and per-user skills from
@@ -74,6 +83,48 @@ func main() {
 	// Pass LiteLLM URL to packages that talk to the proxy directly.
 	db.LiteLLMBaseURL = ai.LiteLLMBaseURL
 	ai_tools.LiteLLMBaseURL = ai.LiteLLMBaseURL
+
+	// Diagnostic watchdog: periodically snapshot ALL goroutine stacks to the
+	// persistent volume so a wedge (goroutine holding a SQLite connection /
+	// mutex forever) is observable after the fact. RATE-LIMITED: dumps at most
+	// once per 10 minutes and prunes to the newest 20 files. Without the cap
+	// this flooded the volume with ~1MB dumps every 30-60s (833MB in 48h) and
+	// masked real incidents behind a wall of noise. Diagnostic only; no
+	// behavior change. Enabled only when DEBUG=1 is set — in production the
+	// ~1MB goroutine dumps are pure overhead/noise.
+	if os.Getenv("DEBUG") == "1" {
+		var lastDump atomic.Int64
+		go func() {
+			for {
+				time.Sleep(5 * time.Minute)
+				now := time.Now().Unix()
+				if now-lastDump.Load() < 10*60 {
+					continue
+				}
+				lastDump.Store(now)
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				base := os.Getenv("USER_DATA_STORAGE")
+				if base == "" {
+					base = "users-data"
+				}
+				dir := filepath.Join(base, "crashwatch")
+				os.MkdirAll(dir, 0o755)
+				path := filepath.Join(dir, fmt.Sprintf("goroutines_%d.txt", time.Now().Unix()))
+				os.WriteFile(path, buf[:n], 0o644)
+				// Prune: keep only the 20 newest dumps.
+				entries, _ := filepath.Glob(filepath.Join(dir, "goroutines_*.txt"))
+				if len(entries) > 20 {
+					// Entries are timestamped; sort ascending and drop the oldest.
+					sort.Strings(entries)
+					for _, old := range entries[:len(entries)-20] {
+						os.Remove(old)
+					}
+				}
+				log.Printf("[watchdog] wrote goroutine dump to %s", path)
+			}
+		}()
+	}
 
 	// CRON scheduler: rebuild every user's jobs from disk and start the loop.
 	cron.Init()
@@ -188,6 +239,15 @@ func main() {
 			w.Write([]byte("OK"))
 		},
 	)).Methods("GET", "OPTIONS")
+
+	// Liveness probe for healthchecks / orchestrators (autoheal, k8s, etc.).
+	// Returns a real 200 JSON (not the SPA catch-all) so external watchers can
+	// distinguish "HTTP stack is up" from a missing route. Deliberately
+	// unauthenticated — healthcheckers have no session cookie.
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}).Methods("GET", "OPTIONS")
 
 	// /static folder as SPA
 	exec, _ := os.Executable()

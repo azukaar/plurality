@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/azukaar/plurality/src/utils"
 )
@@ -194,6 +195,67 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + "..."
+}
+
+// ---------------------------------------------------------------------------
+// Serialized embedding worker.
+//
+// With SetMaxOpenConns(1) the server has ONE SQLite connection per user DB.
+// Spawning a goroutine per message to run EmbedAndStore (the pre-fix path)
+// means N concurrent db.Exec calls queue up waiting for that single
+// connection. Combined with PushMessage's own conn usage and the eco
+// compaction's GetCheckpoint, this pile-up wedges the pool: goroutine dumps
+// showed StoreEmbedding, GetCheckpoint and getConversationFromDB ALL waiting
+// at database/sql.(*DB).conn while connectionOpener itself blocked — a
+// virtual deadlock that hangs the backend and reads as a crash (conversation
+// "Modbus Template Updates" stalled 10:44→10:57 & 11:03→11:03:47 on
+// 2026-09-29).
+//
+// Fix: route every embed through ONE worker goroutine so at most ONE embed
+// runs at a time, and message pushes / live reads are never starved by a
+// backlog of concurrent embeds. The store happens on the shared pool, which
+// is safe here: a single serialized consumer can never deadlock against
+// itself.
+// ---------------------------------------------------------------------------
+type embedJob struct {
+	db             *sql.DB
+	liteLLMBaseURL string
+	sourceType     string
+	sourceID       string
+	text           string
+}
+
+var (
+	embedQueue         = make(chan embedJob, 256)
+	embedWorkerStarted atomic.Bool
+)
+
+func embedWorker() {
+	for job := range embedQueue {
+		EmbedAndStore(job.db, job.liteLLMBaseURL, job.sourceType, job.sourceID, job.text)
+	}
+}
+
+// InitEmbedWorker starts the single background embed consumer. Call once at
+// boot (index.go). Safe to call multiple times.
+func InitEmbedWorker() {
+	if embedWorkerStarted.CompareAndSwap(false, true) {
+		go embedWorker()
+	}
+}
+
+// EnqueueEmbed queues an embedding job for the worker. Never blocks: if the
+// queue is full the job is dropped (embeddings are best-effort search index
+// enrichment; a dropped embed is far cheaper than a wedged backend).
+func EnqueueEmbed(db *sql.DB, liteLLMBaseURL string, sourceType string, sourceID string, text string) {
+	if liteLLMBaseURL == "" || text == "" || len(text) < 3 {
+		return
+	}
+	select {
+	case embedQueue <- embedJob{db, liteLLMBaseURL, sourceType, sourceID, text}:
+	default:
+		utils.Log("[Search] embed queue full — dropping embedding for %s/%s", sourceType, sourceID)
+	}
 }
 
 // EmbedAndStore generates an embedding for the given text and stores it.

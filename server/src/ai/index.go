@@ -178,7 +178,7 @@ func SendChatCompletion(ctx context.Context, model utils.Model, conv utils.Conve
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := utils.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -345,38 +345,62 @@ func convertMessagesToOpenAI(messages []utils.Message, _ utils.Model) ([]Standar
 
 	// Backfill any assistant tool_calls that don't have a matching tool result
 	// before the next user/assistant boundary. Strict providers (Fireworks)
-	// reject dangling tool_calls; this defense recovers conversations whose
-	// history was persisted before the stream-processor fix existed.
+	// reject dangling tool_calls. This defense repairs conversations whose
+	// history was persisted before the stream-processor fix existed (the old
+	// code persisted assistant messages whose tool_calls were cut off
+	// mid-stream with no result ever pushed). Providers also REUSE short
+	// tool-call ids ("call_0") across turns, so only results inside THIS
+	// assistant block are considered — never results from an earlier block.
+	//
+	// When a call in this block genuinely has no result, the ENTIRE call is
+	// dropped rather than inventing an empty "tool" result: an invented
+	// result makes the model believe the tool executed and returned nothing,
+	// so it either loops calling the same tool (the provider keeps issuing
+	// "call_0") or the empty-tool flood pushes the conversation past the
+	// model context limit. Dropping is safe — the model just may re-issue a
+	// genuinely useful call, which is exactly what a truncated-turn call is.
 	out := make([]StandardMessageReq, 0, len(result))
 	i := 0
 	for i < len(result) {
-		out = append(out, result[i])
 		if result[i].Role == "assistant" && len(result[i].ToolCalls) > 0 {
 			j := i + 1
 			for j < len(result) && result[j].Role != "user" && result[j].Role != "assistant" {
 				j++
 			}
 			seen := make(map[string]bool, len(result[i].ToolCalls))
+			blockTools := make([]StandardMessageReq, 0, j-(i+1))
 			for k := i + 1; k < j; k++ {
 				if result[k].Role == "tool" && result[k].ToolCallID != "" {
 					seen[result[k].ToolCallID] = true
 				}
-				out = append(out, result[k])
+				blockTools = append(blockTools, result[k])
 			}
+			// Drop this assistant's tool_calls that have no result in the
+			// block. Prune BEFORE emitting, on a copied message.
+			kept := make([]utils.ToolCall, 0, len(result[i].ToolCalls))
 			for _, tc := range result[i].ToolCalls {
 				if !seen[tc.ID] {
-					utils.Log("[convertMessagesToOpenAI] backfilling missing tool result for tool_call %s (%s)", tc.ID, tc.Function.Name)
-					out = append(out, StandardMessageReq{
-						Role:       "tool",
-						Content:    "No result available for this tool call (likely truncated by token limit).",
-						ToolCallID: tc.ID,
-						Name:       tc.Function.Name,
-					})
+					utils.Log("[convertMessagesToOpenAI] dropping dangling tool_call %s (%s) with no result in block", tc.ID, tc.Function.Name)
+					continue
+				}
+				kept = append(kept, tc)
+			}
+			// Emit the (possibly pruned) assistant only when it still carries
+			// something: kept calls, or text (Content == nil means the
+			// assistant had no text). An assistant with neither is invalid
+			// for the API and only existed to carry the dangling calls.
+			if len(kept) > 0 || result[i].Content != nil {
+				smr := result[i]
+				smr.ToolCalls = kept
+				out = append(out, smr)
+				for _, bt := range blockTools {
+					out = append(out, bt)
 				}
 			}
 			i = j
 			continue
 		}
+		out = append(out, result[i])
 		i++
 	}
 	result = out
@@ -429,7 +453,7 @@ func GenerateImage(request ImageGenerationRequest) ([]byte, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := utils.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -490,7 +514,7 @@ func GenerateTitleForMessage(message, model string) (string, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := utils.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -579,7 +603,7 @@ func GenerateCheckpointSummary(text, model string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := utils.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
