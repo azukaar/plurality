@@ -124,6 +124,8 @@ class ApiService {
   // --- Chat API Methods ---
 
   /// Parse an SSE response stream into a stream of SSEEvent objects.
+  /// Server heartbeats (": ping" comment lines) are skipped — they are
+  /// liveness only, not events.
   Stream<SSEEvent> _parseSSEStream(http.StreamedResponse response) {
     return response.stream
         .transform(utf8.decoder)
@@ -268,6 +270,13 @@ class ApiService {
 
   /// Connect to the global status stream (SSE). Returns lightweight StatusEvents
   /// for all active conversations — no content, just state changes.
+  ///
+  /// Liveness handling: the server emits ": ping" comment lines every 25s so
+  /// the connection stays warm in throttled background tabs. Those lines carry
+  /// no data and are mapped to a synthetic `{'__heartbeat': true}` event
+  /// (conversation_id absent) so the consumer can distinguish "socket alive
+  /// but quiet" from "socket dead" — the ChatService idle watchdog relies on
+  /// this to avoid false reconnects during long silent generations.
   Future<Stream<Map<String, dynamic>>> connectStatusStream() async {
     final request = http.Request('GET', Uri.parse('$baseUrl/status/stream'));
     request.headers['Authorization'] =
@@ -281,9 +290,15 @@ class ApiService {
     return response.stream
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .where((line) => line.startsWith('data: '))
-        .map((line) => line.substring(6))
-        .map((data) => jsonDecode(data) as Map<String, dynamic>);
+        .where((line) => line.startsWith('data: ') || line.trim() == ': ping')
+        .map((line) {
+          if (line.startsWith('data: ')) {
+            final data = line.substring(6);
+            return jsonDecode(data) as Map<String, dynamic>;
+          }
+          // Heartbeat comment — liveness marker, no payload.
+          return const <String, dynamic>{'__heartbeat': true};
+        });
   }
 
   Future<List<Conversation>> getConversations() async {
@@ -665,4 +680,3 @@ class ImageResult {
   final double time;
   ImageResult(this.base64, this.time);
 }
-

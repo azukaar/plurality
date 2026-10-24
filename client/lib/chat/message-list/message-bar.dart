@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:plurality/chat/message-list/copy-button.dart';
 import '../../utils/types.dart';
 import 'dart:convert';
+import 'dart:typed_data';
 
 // Common button styling
 final buttonStyle = IconButton.styleFrom(
@@ -10,6 +11,14 @@ final buttonStyle = IconButton.styleFrom(
   elevation: 2,
   padding: const EdgeInsets.all(0),
 );
+
+// Decode-once cache for bot avatar icons. Image.memory keys its image cache
+// on byte identity, so reusing the same Uint8List instance across rebuilds
+// avoids re-decoding and re-uploading the texture to the GPU on every build
+// (and per streaming chunk, where the toolbar ValueKey changes with the text).
+final Map<String, Uint8List> _avatarCache = {};
+Uint8List _avatarBytes(String url) =>
+    _avatarCache.putIfAbsent(url, () => base64Decode(url));
 
 class MessageToolbar extends StatelessWidget {
   final Widget child;
@@ -72,34 +81,39 @@ class MessageToolbar extends StatelessWidget {
               isBot ? CrossAxisAlignment.start : CrossAxisAlignment.end,
           children: [
             if (iconURL != null && isBot)
-              Container(
-                key:
-                    isLoading
-                        ? ValueKey(
-                          'image_message_toolbar_loading_${iconURL.hashCode}',
-                        )
-                        : ValueKey(
-                          'image_${iconURL.hashCode}_${text.hashCode}',
-                        ),
-                margin: const EdgeInsets.only(bottom: 8),
-                width: 48,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(1000.0),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.1),
-                      blurRadius: 23,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-                clipBehavior: Clip.antiAlias,
-                child: Image.memory(
-                  base64Decode(iconURL!),
+              // RepaintBoundary isolates the avatar from the animated border
+              // and list scrolling; the cached bytes keep MemoryImage stable
+              // so it is decoded/uploaded to the GPU exactly once.
+              RepaintBoundary(
+                child: Container(
+                  key:
+                      isLoading
+                          ? ValueKey(
+                            'image_message_toolbar_loading_${iconURL.hashCode}',
+                          )
+                          : ValueKey(
+                            'image_${iconURL.hashCode}_${text.hashCode}',
+                          ),
+                  margin: const EdgeInsets.only(bottom: 8),
                   width: 48,
-                  height: 48,
-                  fit: BoxFit.cover,
-                  gaplessPlayback: true,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(1000.0),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.1),
+                        blurRadius: 23,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: Image.memory(
+                    _avatarBytes(iconURL!),
+                    width: 48,
+                    height: 48,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                  ),
                 ),
               ),
 

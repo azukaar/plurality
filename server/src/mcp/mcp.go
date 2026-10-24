@@ -537,16 +537,40 @@ func schemaToParameters(raw json.RawMessage) *utils.ParameterToolsRequest {
 			Type        string   `json:"type"`
 			Description string   `json:"description"`
 			Enum        []string `json:"enum"`
+			Items       struct {
+				Type        string   `json:"type"`
+				Description string   `json:"description"`
+				Enum        []string `json:"enum"`
+			} `json:"items"`
 		}
 		_ = json.Unmarshal(propRaw, &prop)
 		if prop.Type == "" {
 			prop.Type = "string"
 		}
-		props[name] = utils.PropertyParameterToolsRequest{
+		newProp := utils.PropertyParameterToolsRequest{
 			Type:        prop.Type,
 			Description: prop.Description,
 			Enum:        prop.Enum,
 		}
+		// Array properties MUST carry an "items" schema — Google's Gemini
+		// endpoint rejects tool declarations whose array params lack it
+		// ("items: missing field" 400s on vision turns). Preserve the item
+		// schema when the MCP tool defined one; otherwise default to string.
+		if prop.Type == "array" {
+			items := utils.PropertyParameterToolsRequest{
+				Type:        "string",
+				Description: "Element of the array.",
+			}
+			if prop.Items.Type != "" {
+				items = utils.PropertyParameterToolsRequest{
+					Type:        prop.Items.Type,
+					Description: prop.Items.Description,
+					Enum:        prop.Items.Enum,
+				}
+			}
+			newProp.Items = &items
+		}
+		props[name] = newProp
 	}
 	typ := schema.Type
 	if typ == "" {

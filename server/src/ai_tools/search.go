@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"net/url"
 	"os"
 
@@ -71,7 +70,7 @@ var SearchTool = utils.AITool{
 		)
 
 		// Make the request
-		resp, err := http.Get(searchURL)
+		resp, err := utils.HTTPClient.Get(searchURL)
 		if err != nil {
 			return utils.NewTextContent(fmt.Sprintf("Error making search request: %s", err.Error()))
 		}

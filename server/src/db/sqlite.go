@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/mattn/go-sqlite3"
@@ -82,6 +83,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
 	source_id   TEXT NOT NULL,
 	embedding   float[1536] distance_metric=cosine
 );
+
+-- Clean up embeddings when a message is deleted (parity with messages_fts_delete).
+-- Previously there was no trigger, so deleting a message left a dangling vector
+-- that permanently occupied ~6KB in the vec_embeddings shadow tables.
+CREATE TRIGGER IF NOT EXISTS messages_vec_delete AFTER DELETE ON messages
+BEGIN
+	DELETE FROM vec_embeddings WHERE source_type = 'message' AND source_id = CAST(OLD.id AS TEXT);
+END;
 `
 
 // InitSQLite reads the USER_DATA_STORAGE env var (default "./users-data"
@@ -143,12 +152,74 @@ func GetUserDB(userID string) (*sql.DB, error) {
 		utils.Error("[SQLite] migration response_cost failed", err)
 	}
 
+	// Best-effort storage maintenance: truncate oversized stored message
+	// blobs (legacy rows persisted before eco/compaction truncated them in
+	// memory), drop orphaned embeddings, and rebuild the FTS index. Runs
+	// once per process per user on first open. Never blocks startup.
+	RunStorageMaintenance(db)
+
 	actual, _ := userDBs.LoadOrStore(userID, db)
 	if actual.(*sql.DB) != db {
 		db.Close()
 	}
 
+	// Start the periodic WAL checkpoint for this database. SQLite's
+	// built-in wal_autocheckpoint only fires when a connection is idle at a
+	// commit boundary; with SetMaxOpenConns(1) the lone connection is
+	// continuously busy under load and the WAL grows without bound. An
+	// unbounded WAL is a real failure mode: it slows every write, and a
+	// crash mid-write forces a long WAL replay on the next start (observed:
+	// a 550 MB WAL on this instance after a busy workflow, followed by a
+	// stall/restart loop). A periodic TRUNCATE checkpoint both folds the WAL
+	// into the main DB file and returns the WAL pages to the filesystem.
+	startWalCheckpointLoop(db, userID)
+
 	return actual.(*sql.DB), nil
+}
+
+// walCheckpointInterval is how often each user DB's WAL is checkpointed.
+// 30s is frequent enough to keep the WAL small under sustained write churn
+// (a busy LLM loop writes many messages per second) without adding
+// noticeable overhead: TRUNCATE only copies back pages that actually exist
+// in the WAL, and it is a no-op when the WAL is empty.
+const walCheckpointInterval = 30 * time.Second
+
+// startWalCheckpointLoop launches a per-database background goroutine that
+// periodically runs PRAGMA wal_checkpoint(TRUNCATE). TRUNCATE is used (not
+// PASSIVE) so the WAL file is actually shrunk back to zero, not just folded
+// into the main DB; otherwise the on-disk WAL keeps its high-water mark.
+//
+// The loop is deliberately independent of the connection pool: it uses the
+// same *sql.DB, so it serializes with the single open connection like every
+// other query. The goroutine lives for the lifetime of the process (or until
+// the DB is closed and the cache entry is dropped).
+func startWalCheckpointLoop(db *sql.DB, userID string) {
+	go func() {
+		ticker := time.NewTicker(walCheckpointInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			// If CloseAllUserDBs already dropped this database from the
+			// cache (shutdown), stop checkpointing — QueryRow on a closed
+			// pool would just error forever.
+			if _, stillCached := userDBs.Load(userID); !stillCached {
+				return
+			}
+			// A checkpoint on a busy database can legitimately return
+			// SQLITE_BUSY — that is not an error we need to act on, the
+			// next tick tries again. Any other failure is logged and
+			// swallowed; checkpointing is best-effort and must never take
+			// the DB down.
+			var result int
+			var log, wal int
+			if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&result, &log, &wal); err != nil {
+				utils.Debug("[SQLite] WAL checkpoint failed for %s: %v", userID, err)
+				continue
+			}
+			if log > 0 || wal > 0 {
+				utils.Log("[SQLite] WAL checkpoint for %s: busy=%d log=%d checkpointed=%d", userID, result, log, wal)
+			}
+		}
+	}()
 }
 
 // ensureColumn adds a column to an existing table if it does not yet exist.
@@ -169,9 +240,31 @@ func ensureColumn(db *sql.DB, table, column, decl string) error {
 }
 
 // CloseAllUserDBs closes every cached user database. Call on shutdown.
+// Before closing, each database's WAL is checkpointed so a SIGTERM / restart
+// never leaves a multi-hundred-MB WAL behind (observed: 550 MB WAL after a
+// busy workflow was killed mid-write; the WAL replay on the next start
+// stalled the server and contributed to the restart loop). Conversations
+// left in "processing" by the kill are also reset to "idle" so the
+// auto-resume path (#48) cannot re-enter a runaway loop on boot.
 func CloseAllUserDBs() {
 	userDBs.Range(func(key, value any) bool {
-		value.(*sql.DB).Close()
+		db := value.(*sql.DB)
+		userID := key.(string)
+		// Reset any conversation left in a processing-like state by an
+		// unclean shutdown. A "processing" row with no live request would
+		// otherwise be picked up by the stalled-conversation auto-resume
+		// (#48) on the next start, re-entering whatever loop was killed.
+		if _, err := db.Exec(`UPDATE conversations SET state = 'idle' WHERE state IN ('processing','waiting_for_tool','waiting_for_approval')`); err != nil {
+			utils.Debug("[SQLite] failed to reset stuck states for %s: %v", userID, err)
+		}
+		// Fold the WAL into the main DB file and shrink it back to zero.
+		// Best-effort: if the checkpoint fails (e.g. a write is still in
+		// flight), the periodic loop would have handled it anyway.
+		var result, log, wal int
+		if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&result, &log, &wal); err == nil && (log > 0 || wal > 0) {
+			utils.Log("[SQLite] final WAL checkpoint for %s: busy=%d log=%d checkpointed=%d", userID, result, log, wal)
+		}
+		db.Close()
 		userDBs.Delete(key)
 		return true
 	})

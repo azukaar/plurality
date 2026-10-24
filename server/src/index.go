@@ -3,11 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/azukaar/plurality/src/ai"
 	"github.com/azukaar/plurality/src/ai_tools"
@@ -42,7 +49,16 @@ func main() {
 	startup.Run()
 	db.InitSQLite()
 	defer db.CloseAllUserDBs()
+	// Single serialized embedding worker — without it, every message push
+	// spawns a goroutine that queues on the SetMaxOpenConns(1) SQLite pool
+	// and wedges the backend under load (see search/search.go).
+	search.InitEmbedWorker()
 	storage.Init()
+
+	// Repair conversations left in a non-idle state by a previous server
+	// lifetime (crashed mid-turn, wait timer that died with the process).
+	// Must run after the per-user SQLite DBs are available.
+	db.RecoverStuckConversations(context.Background())
 
 	// Load global server-side skills from data/skills/ and per-user skills from
 	// users-data/{userID}/skills/. The retrieve_server_skill tool is registered
@@ -74,6 +90,48 @@ func main() {
 	// Pass LiteLLM URL to packages that talk to the proxy directly.
 	db.LiteLLMBaseURL = ai.LiteLLMBaseURL
 	ai_tools.LiteLLMBaseURL = ai.LiteLLMBaseURL
+
+	// Diagnostic watchdog: periodically snapshot ALL goroutine stacks to the
+	// persistent volume so a wedge (goroutine holding a SQLite connection /
+	// mutex forever) is observable after the fact. RATE-LIMITED: dumps at most
+	// once per 10 minutes and prunes to the newest 20 files. Without the cap
+	// this flooded the volume with ~1MB dumps every 30-60s (833MB in 48h) and
+	// masked real incidents behind a wall of noise. Diagnostic only; no
+	// behavior change. Enabled only when DEBUG=1 is set — in production the
+	// ~1MB goroutine dumps are pure overhead/noise.
+	if os.Getenv("DEBUG") == "1" {
+		var lastDump atomic.Int64
+		go func() {
+			for {
+				time.Sleep(5 * time.Minute)
+				now := time.Now().Unix()
+				if now-lastDump.Load() < 10*60 {
+					continue
+				}
+				lastDump.Store(now)
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				base := os.Getenv("USER_DATA_STORAGE")
+				if base == "" {
+					base = "users-data"
+				}
+				dir := filepath.Join(base, "crashwatch")
+				os.MkdirAll(dir, 0o755)
+				path := filepath.Join(dir, fmt.Sprintf("goroutines_%d.txt", time.Now().Unix()))
+				os.WriteFile(path, buf[:n], 0o644)
+				// Prune: keep only the 20 newest dumps.
+				entries, _ := filepath.Glob(filepath.Join(dir, "goroutines_*.txt"))
+				if len(entries) > 20 {
+					// Entries are timestamped; sort ascending and drop the oldest.
+					sort.Strings(entries)
+					for _, old := range entries[:len(entries)-20] {
+						os.Remove(old)
+					}
+				}
+				log.Printf("[watchdog] wrote goroutine dump to %s", path)
+			}
+		}()
+	}
 
 	// CRON scheduler: rebuild every user's jobs from disk and start the loop.
 	cron.Init()
@@ -189,6 +247,15 @@ func main() {
 		},
 	)).Methods("GET", "OPTIONS")
 
+	// Liveness probe for healthchecks / orchestrators (autoheal, k8s, etc.).
+	// Returns a real 200 JSON (not the SPA catch-all) so external watchers can
+	// distinguish "HTTP stack is up" from a missing route. Deliberately
+	// unauthenticated — healthcheckers have no session cookie.
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}).Methods("GET", "OPTIONS")
+
 	// /static folder as SPA
 	exec, _ := os.Executable()
 	pwd := filepath.Dir(exec)
@@ -213,8 +280,46 @@ func main() {
 
 	http.Handle("/", corsMiddleware(r))
 
+	srv := &http.Server{Addr: ":8090", Handler: nil}
+
+	// Graceful shutdown on SIGTERM/SIGINT. The container supervisor sends
+	// SIGTERM on `docker stop` / restart; without this hook the process dies
+	// immediately and CloseAllUserDBs (WAL checkpoint + stuck-state reset in
+	// db/sqlite.go) never runs — leaving a multi-hundred-MB WAL and
+	// "processing" conversations behind (observed: 550 MB WAL + a runaway
+	// workflow that auto-resumed on every restart). We wait briefly for
+	// in-flight LLM loops to notice the cancellation, then checkpoint and
+	// close the DBs.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		sig := <-sigCh
+		utils.Log("[main] received signal %v — shutting down gracefully", sig)
+
+		// Stop accepting new connections; in-flight LLM loops run on their
+		// own request-scoped contexts and are not tied to srv.Shutdown, so
+		// this only bounds the HTTP handler drain.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = srv.Shutdown(ctx)
+		cancel()
+
+		// NOTE: os.Exit does NOT run deferred functions, so every shutdown
+		// step below is called explicitly (not via defer). Order matters:
+		// DBs last, after the subsystems that still write to them.
+		webhook.Shutdown()
+		ai.ShutdownLiteLLM()
+		mcp.Shutdown()
+		cron.Shutdown()
+		// CloseAllUserDBs checkpoints every WAL (TRUNCATE) and resets stuck
+		// conversation states (processing/waiting_for_*) so the next boot
+		// starts clean instead of auto-resuming a killed loop.
+		db.CloseAllUserDBs()
+
+		os.Exit(0)
+	}()
+
 	log.Printf("Server starting on port 8090...")
-	log.Fatal(http.ListenAndServe(":8090", nil))
+	log.Fatal(srv.ListenAndServe())
 }
 
 func handleSearch(w http.ResponseWriter, r *http.Request) {

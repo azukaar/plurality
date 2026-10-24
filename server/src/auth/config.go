@@ -88,9 +88,19 @@ type NotificationsConfig struct {
 // assistant message's prompt_tokens). When the previous prompt crosses
 // TriggerTokens, the oldest turns are summarised into a single checkpoint so
 // the remaining live tail is roughly TargetTokens wide.
+//
+// ContextFraction makes the trigger dynamic per model: when a model declares
+// a context window (litellm_config.yaml model_info.context_window) the
+// effective trigger is min(TriggerTokens, round(ContextFraction * window)).
+// So a 64k model with ContextFraction 0.8 compacts at 51,200 tokens instead
+// of waiting forever for the old static 100k floor that a small window could
+// never reach. ContextFraction <= 0 disables the dynamic part (static
+// trigger only). If the model window is unknown, the static TriggerTokens is
+// used unchanged.
 type EcoConfig struct {
-	TriggerTokens int `json:"trigger_tokens"`
-	TargetTokens  int `json:"target_tokens"`
+	TriggerTokens   int     `json:"trigger_tokens"`
+	TargetTokens    int     `json:"target_tokens"`
+	ContextFraction float64 `json:"context_fraction"`
 }
 
 type Config struct {
@@ -107,6 +117,7 @@ const (
 	defaultPerWebhookPerMinute = 10
 	defaultEcoTriggerTokens    = 100000
 	defaultEcoTargetTokens     = 50000
+	defaultEcoContextFraction  = 0.8
 )
 
 // ReservedShortcutNames are the picker-visible shortcut names, in display order.
@@ -154,8 +165,9 @@ func LoadConfig() error {
 				PerWebhookPerMinute: defaultPerWebhookPerMinute,
 			},
 			Eco: EcoConfig{
-				TriggerTokens: defaultEcoTriggerTokens,
-				TargetTokens:  defaultEcoTargetTokens,
+				TriggerTokens:   defaultEcoTriggerTokens,
+				TargetTokens:    defaultEcoTargetTokens,
+				ContextFraction: defaultEcoContextFraction,
 			},
 		}
 		validateShortcuts(&cfg)
@@ -191,6 +203,10 @@ func LoadConfig() error {
 		}
 		if loaded.Eco.TargetTokens <= 0 {
 			loaded.Eco.TargetTokens = defaultEcoTargetTokens
+			needsWrite = true
+		}
+		if loaded.Eco.ContextFraction <= 0 {
+			loaded.Eco.ContextFraction = defaultEcoContextFraction
 			needsWrite = true
 		}
 		cfg = loaded

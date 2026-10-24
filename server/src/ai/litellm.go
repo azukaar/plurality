@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/azukaar/plurality/src/utils"
@@ -20,6 +21,11 @@ var LiteLLMBaseURL = "http://127.0.0.1:4000"
 var litellmProcess *exec.Cmd
 var litellmMu sync.Mutex
 var litellmReady atomic.Bool
+
+// shuttingDown is set by ShutdownLiteLLM so a watchProcess goroutine woken by
+// the kill knows not to spawn a replacement (which would orphan a fresh proxy
+// when the server exits).
+var shuttingDown bool
 
 // InitLiteLLM initializes the LiteLLM proxy connection.
 // If LITELLM_URL is set (Docker/external), it just uses that URL.
@@ -36,6 +42,23 @@ func InitLiteLLM() error {
 	}
 
 	utils.Log("[LiteLLM] Starting local proxy on port 4000...")
+
+	// If a proxy is already answering on the port — e.g. because a previous
+	// server process died without cleaning up its child (observed: rc=1 exit
+	// leaves uvicorn orphaned on :4000) — adopt it instead of spawning a
+	// second uvicorn that will crash-loop on EADDRINUSE. `litellmReady` stays
+	// false until it passes the health check below, so callers never see a
+	// half-initialized proxy.
+	if probeHealth(2*time.Second) == nil {
+		utils.Log("[LiteLLM] Adopting existing healthy proxy at %s", LiteLLMBaseURL)
+		if err := waitForHealth(10 * time.Second); err != nil {
+			return fmt.Errorf("LiteLLM proxy on %s stopped responding: %w", LiteLLMBaseURL, err)
+		}
+		litellmReady.Store(true)
+		utils.Log("[LiteLLM] Proxy is ready at %s", LiteLLMBaseURL)
+		return nil
+	}
+
 	if err := startLocalProcess(); err != nil {
 		return fmt.Errorf("failed to start LiteLLM: %w", err)
 	}
@@ -60,10 +83,16 @@ func ShutdownLiteLLM() {
 	defer litellmMu.Unlock()
 
 	litellmReady.Store(false)
+	shuttingDown = true
 
 	if litellmProcess != nil && litellmProcess.Process != nil {
 		utils.Log("[LiteLLM] Shutting down proxy...")
-		litellmProcess.Process.Kill()
+		// The proxy runs in its own process group (Setpgid in
+		// startLocalProcess), so this reaches uvicorn even if it has forked
+		// children/pgid changes. Without it a server exit can orphan the
+		// proxy on :4000 and every later boot crash-loops on EADDRINUSE
+		// (observed: 3750 "address already in use" restarts over 24h).
+		syscall.Kill(-litellmProcess.Process.Pid, syscall.SIGTERM)
 		litellmProcess.Wait()
 		litellmProcess = nil
 	}
@@ -77,6 +106,16 @@ func LiteLLMReady() bool {
 func startLocalProcess() error {
 	litellmMu.Lock()
 	defer litellmMu.Unlock()
+
+	// Refuse to double-start. There must be exactly one proxy; spawning a
+	// second uvicorn while the first holds :4000 produces the EADDRINUSE
+	// crash-loop. If a live process is already being supervised, this is a
+	// no-op (watchProcess can call us from the restart loop after a genuine
+	// crash replaced litellmProcess — but never while the old one is alive).
+	if litellmProcess != nil && litellmProcess.Process != nil {
+		utils.Log("[LiteLLM] Proxy process %d still running — not starting a duplicate", litellmProcess.Process.Pid)
+		return nil
+	}
 
 	configPath := findConfigPath()
 	if configPath == "" {
@@ -92,6 +131,9 @@ func startLocalProcess() error {
 	cmd := exec.Command(pythonBin, proxyScript, "--config", configPath, "--port", "4000", "--host", "127.0.0.1")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Own process group so ShutdownLiteLLM can SIGTERM the whole group and
+	// never orphan a uvicorn that keeps :4000 bound after a fast exit.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start LiteLLM process: %w", err)
@@ -101,17 +143,27 @@ func startLocalProcess() error {
 	return nil
 }
 
+// probeHealth performs a single health request against the proxy. Returns nil
+// if a healthy response was received, or a non-nil error otherwise.
+func probeHealth(timeout time.Duration) error {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(LiteLLMBaseURL + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func waitForHealth(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 2 * time.Second}
 
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(LiteLLMBaseURL + "/health")
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
-			}
+		if probeHealth(2 * time.Second) == nil {
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -124,6 +176,10 @@ func watchProcess() {
 
 	for {
 		litellmMu.Lock()
+		if shuttingDown {
+			litellmMu.Unlock()
+			return
+		}
 		cmd := litellmProcess
 		litellmMu.Unlock()
 
@@ -132,6 +188,16 @@ func watchProcess() {
 		}
 
 		err := cmd.Wait()
+		// The watched process is gone either way — clear the reference under
+		// the lock so a later restart can spawn a fresh one instead of
+		// "adopting" a dead process.
+		litellmMu.Lock()
+		if litellmProcess == cmd {
+			litellmProcess = nil
+		}
+		wasShuttingDown := shuttingDown
+		litellmMu.Unlock()
+
 		if err == nil {
 			utils.Log("[LiteLLM] Proxy exited cleanly")
 			litellmReady.Store(false)
@@ -139,23 +205,34 @@ func watchProcess() {
 		}
 
 		litellmReady.Store(false)
+		if wasShuttingDown {
+			utils.Log("[LiteLLM] Proxy terminated during shutdown — not restarting")
+			return
+		}
+
 		utils.Error("[LiteLLM] Proxy crashed, restarting in %s...", err, backoff)
 		time.Sleep(backoff)
 
 		if err := startLocalProcess(); err != nil {
 			utils.Error("[LiteLLM] Failed to restart proxy", err)
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-			continue
 		}
 
 		if waitForHealth(15*time.Second) == nil {
 			litellmReady.Store(true)
 			utils.Log("[LiteLLM] Proxy restarted successfully")
+			backoff = time.Second
+		} else {
+			// The replacement never came up — likely a port conflict or a
+			// repeatedly-failing process. Back off so we don't spawn-storm
+			// (observed: 3750 EADDRINUSE restarts in 24h pinning CPU and
+			// killing conversations). A later health failure or a manual
+			// restart will retry.
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			utils.Error("[LiteLLM] Proxy did not become healthy; next restart attempt in %s", err, backoff)
 		}
-		backoff = time.Second
 	}
 }
 

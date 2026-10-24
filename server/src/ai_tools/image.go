@@ -169,7 +169,7 @@ var ImageGenTool = utils.AITool{
 			req.Header.Set("Content-Type", "application/json")
 		}
 
-		client := &http.Client{}
+		client := utils.HTTPClient
 		resp, err := client.Do(req)
 		if err != nil {
 			return utils.NewTextContent(fmt.Sprintf("Error making request: %s", err.Error()))
@@ -217,6 +217,24 @@ var ImageGenTool = utils.AITool{
 				})
 			}
 			return utils.NewTextContent("No image data received")
+		}
+
+		// Decode the FULL payload and verify it is a real, non-empty image.
+		// Some providers return HTTP 200 with a stub body (empty base64,
+		// zero inference time, or a placeholder) — observed as the
+		// "Generated in 0.00s" dead-end on the face-swap workflow, where the
+		// LLM then hallucinated attachment IDs for images that were never
+		// persisted ("Attachments not found: att_8"). Fail loudly with a
+		// recoverable error so the model can retry / switch model instead of
+		// building its next step on a phantom image.
+		decodedBytes, decErr := base64.StdEncoding.DecodeString(imageData)
+		if decErr != nil || len(decodedBytes) == 0 {
+			return utils.NewTextContent(fmt.Sprintf(
+				"Image request returned an empty result (no image bytes; inference %.2fs). The provider/model may not support this prompt or was rate-limited. Retry once, or switch to a different image model and try again.",
+				infTime))
+		}
+		if sniffImageMime(decodedBytes) == "" {
+			return utils.NewTextContent("Image request returned an unrecognized payload (not a valid PNG/JPEG/WebP image). Retry or switch image model.")
 		}
 
 		// Detect actual image format from the base64 data

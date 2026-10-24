@@ -18,13 +18,13 @@ docker run -d --name plurality \
   -e OPENROUTER_API_KEY=xxxxx \
   -e INIT_ADMIN_USER=admin \
   -e INIT_ADMIN_PASSWORD=change-me \
-  azukaar/plurality
+  ghcr.io/aseracorp/plurality
 ```
 
 ```yml
 services:
   plurality2:
-    image: azukaar/plurality
+    image: ghcr.io/aseracorp/plurality
     container_name: plurality2
     ports:
       - "8090:8090"
@@ -119,6 +119,7 @@ Env vars override anything in `config.json`.
 | `NTFY_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` | Enable the NTFY-based notification tool (needs URL + topic). |
 | `GOOGLE_SEARCH_API_KEY` / `GOOGLE_SEARCH_ENGINE_ID` | Credentials for web search. |
 | `NEWS_API_KEY` | Credential for the news tool. |
+| `MAX_LOOP_ITERATIONS` | Per-request LLM iteration budget for the runaway-loop guard in `RunLLMLoop` (default `150`; the guard pauses a turn that exceeds this with no further user input). Tune up for unusually long autonomous workflows, or down if a conversation is observed spinning. |
 | `LOG_LEVEL` | Set to `DEBUG` for verbose logs. |
 
 ## Behind a reverse proxy

@@ -1,0 +1,155 @@
+name: Docker Image
+
+# Build a multi-arch Docker image and publish it to the GitHub Container
+# Registry (GHCR) on every push to master.
+#
+# This replaces the legacy CircleCI pipeline (.circleci/config.yml) and
+# mirrors its proven design on GitHub Actions:
+#   * One job per architecture (linux/amd64, linux/arm64), each with its own
+#     isolated `type=gha` cache scope so the two arches never evict each
+#     other under GH Actions' 10 GB GHA-layer-cache limit.
+#   * A final merge job stitches the per-arch images into a single multi-arch
+#     manifest under the consumable tags.
+#
+# Images are pushed to ghcr.io/aseracorp/plurality (GHCR) instead of Docker
+# Hub. Authentication uses the built-in GITHUB_TOKEN with the
+# `packages: write` permission — no external registry credentials needed.
+#
+# Tags pushed:
+#   ghcr.io/aseracorp/plurality:<sha>-<arch>   — per-arch intermediates
+#   ghcr.io/aseracorp/plurality:<sha>          — multi-arch (consumable)
+#   ghcr.io/aseracorp/plurality:<version>      — multi-arch, e.g. 2.0.10
+#   ghcr.io/aseracorp/plurality:latest         — multi-arch
+#
+# The version tag is derived from client/pubspec.yaml (single source of truth,
+# e.g. "2.0.10+25"), stripping the "+build" suffix to keep the tag clean.
+#
+# Caching:
+#   * Per-arch `type=gha` layer cache (mode=max) keeps each arch's layers
+#     warm between runs without the two arches fighting over the 10 GB limit.
+#   * The dockerfile additionally uses BuildKit cache mounts
+#     (--mount=type=cache) for the Flutter SDK clone, pub cache, Go module +
+#     build caches, and the LiteLLM venv — the heavy dependency installs stay
+#     warm even when the GHA layer cache is evicted.
+
+on:
+  push:
+    branches: [ master ]
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read app version
+        id: appversion
+        run: |
+          VERSION=$(grep '^version:' client/pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | tr -d '[:space:]')
+          # Strip the "+build" suffix so the docker tag stays clean (2.0.10+25 -> 2.0.10)
+          VERSION="${VERSION%%+*}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using app version: $VERSION"
+        shell: bash
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }}
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: ./dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          # CACHEBUST = commit sha forces the dockerfile's Go build layer to be
+          # RECOMPILED on every push. Without this, the GHA layer cache
+          # (cache-to mode=max) + the dockerfile's BuildKit --mount=type=cache
+          # for the Go build cache reuse the previous compiled binary, so the
+          # published image ships a STALE server binary even though the source
+          # is up to date. This was the root cause of the recurring
+          # 'still crashing / old binary' issue.
+          build-args: |
+            CACHEBUST=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
+            ${{ env.IMAGE }}:${{ steps.appversion.outputs.version }}-${{ matrix.arch }}
+            ${{ env.IMAGE }}:latest-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ github.repository }}-${{ matrix.arch }},mode=max
+
+  merge:
+    name: Merge multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read app version
+        id: appversion
+        run: |
+          VERSION=$(grep '^version:' client/pubspec.yaml | sed -E 's/^version:[[:space:]]*//' | tr -d '[:space:]')
+          VERSION="${VERSION%%+*}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          set -euxo pipefail
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ github.sha }}" \
+            -t "$IMAGE:${{ steps.appversion.outputs.version }}" \
+            -t "$IMAGE:latest" \
+            "$IMAGE:${{ github.sha }}-amd64" \
+            "$IMAGE:${{ github.sha }}-arm64"
+
+      - name: Verify multi-arch manifest
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ github.sha }}"
+          echo "Published:"
+          echo "  $IMAGE:${{ github.sha }}"
+          echo "  $IMAGE:${{ steps.appversion.outputs.version }}"
+          echo "  $IMAGE:latest"

@@ -18,6 +18,13 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/rendering.dart';
 
+// Conditional import: the web build registers a document-level
+// visibilitychange listener (to recover SSE sockets that Firefox dropped
+// while the tab was backgrounded); desktop/mobile get a no-op stub and
+// rely on the WidgetsBindingObserver lifecycle instead.
+import 'package:plurality/api/web_visibility.dart'
+    if (dart.library.io) 'package:plurality/api/web_visibility_stub.dart';
+
 final authStateProvider = StreamProvider<User?>((ref) {
   return AuthService().authStateChanges;
 });
@@ -64,13 +71,33 @@ class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initDeepLinks();
+    _initVisibilityListener();
+  }
+
+  /// Firefox (and other browsers) throttle background tabs and can drop
+  /// long-lived SSE sockets without firing onError/onDone. When the user
+  /// clicks back into the tab, the document becomes visible again — hook
+  /// that event to force-reconnect any stuck session and refresh the
+  /// global status stream. Without this the chat can sit frozen on
+  /// "processing" until a manual tab reload.
+  void _initVisibilityListener() {
+    registerVisibilityListener(() {
+      // Only reconnect when authenticated — the ChatService itself also
+      // guards on _connected, but avoid the churn of a reconnectVisible()
+      // against a logged-out / signed-out session.
+      if (ref.read(authStateProvider).valueOrNull != null) {
+        ChatService().reconnectVisible();
+      }
+    });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       // On mobile the OS may have severed SSE sockets while backgrounded,
-      // leaving the chat UI stuck on "loading" against a dead stream.
+      // leaving the chat UI stuck on "loading" against a dead stream. On
+      // web this also covers the (less reliable) resume path; the primary
+      // web recovery is the visibilitychange listener above.
       ChatService().handleAppResumed();
     }
   }

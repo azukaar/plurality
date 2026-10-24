@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import './storage.dart';
@@ -61,7 +62,7 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
     Map<String, List<Conversation>> folderMap = {};
 
     for (var conv in conversations) {
-      String folderName = conv.folder ?? "";
+      String folderName = conv.folder ?? '';
 
       if (!folderMap.containsKey(folderName)) {
         folderMap[folderName] = [];
@@ -81,12 +82,28 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
     );
   }
 
-  // Simply update all methods to maintain both state properties
-
+  /// Refresh the conversation list.
+  ///
+  /// Important: the local in-memory `state.conversations` is the source of
+  /// truth the UI watches. On web, Hive now stores metadata only (no messages
+  /// / blobs), so there is nothing extra to load from it — the old
+  /// implementation re-read + re-deserialized the entire Hive box on EVERY
+  /// refresh and on EVERY conversation open, which is the seconds-long
+  /// click-to-open stall and a big chunk of the GC/GPU jank. We keep the
+  /// in-memory list and only swap in the freshly-fetched server metadata.
   Future<void> _loadConversationsFromServer() async {
-    _loadConversations();
-    var newConv = await apiService.getConversations();
+    final newConv = await apiService.getConversations();
     await ConversationStorage.mergeConversations(newConv);
+    if (kIsWeb) {
+      // Web: in-memory list is authoritative; Hive is metadata cache only.
+      if (newConv.isNotEmpty) {
+        state = ConversationsState(
+          conversations: newConv,
+          folderMap: _organizeFolders(newConv),
+        );
+      }
+      return;
+    }
     _loadConversations();
   }
 
@@ -98,7 +115,20 @@ class ConversationsNotifier extends StateNotifier<ConversationsState> {
     var conv = await apiService.getConversation(id);
     if (conv != null) {
       await ConversationStorage.saveConversation(conv);
-      _loadConversations();
+      if (kIsWeb) {
+        // Update the in-memory list with this conversation's fresh messages
+        // without re-reading the whole Hive box.
+        final updatedConversations = state.conversations.map((c) {
+          if (c.id == id) return conv!;
+          return c;
+        }).toList();
+        state = ConversationsState(
+          conversations: updatedConversations,
+          folderMap: _organizeFolders(updatedConversations),
+        );
+      } else {
+        _loadConversations();
+      }
       // The freshly-loaded messages might end on an unanswered client tool
       // call (previous client crashed / was closed mid-execution). Hand it
       // to ChatService which guards against double-dispatch via the lock,

@@ -56,6 +56,23 @@ func (mc MessageContent) TextContent() string {
 	return ""
 }
 
+// TotalContentChars returns the TOTAL character length across ALL text
+// content parts. TextContent() only returns the FIRST text part, so a
+// multi-part message whose first part is a short preamble can hide a
+// multi-MB blob in a later part (observed: conversations__retrieve_conversation
+// results — first part "[Attachment att_N, bytes 0-50000 of 4901042]",
+// then a ~4.9MB JSON part). Context-safety code must size against this
+// total, not TextContent().
+func (mc MessageContent) TotalContentChars() int {
+	total := 0
+	for _, part := range mc.parts {
+		if part.Type == "text" {
+			total += len(part.Text)
+		}
+	}
+	return total
+}
+
 // ContentParts returns the underlying []ContentPart slice.
 func (mc MessageContent) ContentParts() []ContentPart {
 	return mc.parts
@@ -285,10 +302,17 @@ type ParameterToolsRequest struct {
 	Required   []string                                 `json:"required,omitempty"`
 }
 
+// PropertyParameterToolsRequest describes a single property inside a tool's
+// parameters schema. Items is required for array-typed properties — Google's
+// Gemini endpoint rejects function declarations whose array properties lack a
+// schema-level "items" (GenerateContentRequest proto validation), which broke
+// vision-model turns that sent array params. Array params default to
+// items:{"type":"string"} when no richer item schema is available.
 type PropertyParameterToolsRequest struct {
-	Type        string   `json:"type"`
-	Description string   `json:"description"`
-	Enum        []string `json:"enum,omitempty"`
+	Type        string                            `json:"type"`
+	Description string                            `json:"description"`
+	Enum        []string                          `json:"enum,omitempty"`
+	Items       *PropertyParameterToolsRequest    `json:"items,omitempty"`
 }
 
 // AITool is a server-side tool registered in the tool registry.

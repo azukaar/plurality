@@ -119,9 +119,11 @@ async def list_models():
             "owned_by": "plurality",
         }
         # Surface capability metadata so the Go server can drive its registry from this.
-        # We only expose capability flags — never api keys or other proxy-internal config.
+        # We only expose capability flags and context_window — never api keys or
+        # other proxy-internal config.
         for k in ("mode", "supports_vision", "supports_function_calling",
-                  "supports_audio_input", "supports_audio_output"):
+                  "supports_audio_input", "supports_audio_output",
+                  "context_window"):
             if k in info:
                 entry[k] = info[k]
         models.append(entry)

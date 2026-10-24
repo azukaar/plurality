@@ -1,26 +1,33 @@
 import 'package:hive_ce/hive.dart';
 import 'package:hive_ce_flutter/hive_flutter.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:uuid/uuid.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import '../utils/types.dart';
-import '../auth/auth-service.dart';
 
 class ConversationStorage {
   static const String _conversationBoxName = 'conversations';
+
+  /// On web, Hive keeps only a lightweight metadata snapshot (no messages, no
+  /// base64 image blobs) in this box. The server is the source of truth for
+  /// message history; persisting full conversations to IndexedDB made every
+  /// open re-read + re-deserialize the ENTIRE history of every conversation
+  /// synchronously on the UI isolate — the seconds-long click-to-open delay
+  /// and the jank/GC/GPU crashes (a cold tab was faster precisely because
+  /// it had less cached data to read back).
+  static const String _webMetaBoxName = 'conversations_meta';
+
+  static bool get _useMetaOnly => kIsWeb;
 
   // Initialize Hive
   static Future<void> init() async {
     try {
       final appDocumentDirectory = await getApplicationSupportDirectory();
-
       print(
         'Storage - init - Initializing Hive at ${appDocumentDirectory.path}',
       );
-
       Hive.init(appDocumentDirectory.path);
     } catch (e) {
       Hive.initFlutter();
@@ -40,14 +47,13 @@ class ConversationStorage {
     Hive.registerAdapter(MiniAppInputAdapter());
     Hive.registerAdapter(ClientLockAdapter());
 
-    // Open box
     if (!kIsWeb) {
       try {
         await Hive.openBox<Conversation>(_conversationBoxName);
       } catch (e) {
         final appDocumentDirectory = await getApplicationSupportDirectory();
         // wait 1 sec and try again
-        await Future.delayed(Duration(seconds: 1));
+        await Future.delayed(const Duration(seconds: 1));
 
         print('Storage - init - Error opening box $_conversationBoxName');
         // delete the box and try again
@@ -81,26 +87,49 @@ class ConversationStorage {
         await Hive.openBox<Conversation>(_conversationBoxName);
       }
     } else {
-      print('Storage - init - Hive initialized for web');
+      print('Storage - init - Hive initialized for web (metadata-only mode)');
 
-      // Delete the box completely
-      await Hive.deleteBoxFromDisk(_conversationBoxName);
+      // Clean any legacy full-message box from previous versions. It holds
+      // every conversation's messages + base64 image blobs in IndexedDB;
+      // we no longer keep it in memory on web.
+      try {
+        await Hive.deleteBoxFromDisk(_conversationBoxName);
+      } catch (_) {}
 
-      // Additional cleanup for indexedDB
-      await Hive.deleteFromDisk();
-
-      await Hive.openBox<Conversation>(_conversationBoxName);
+      // (Re)open the lightweight metadata box.
+      await Hive.openBox<Conversation>(_webMetaBoxName);
     }
   }
 
   // Get the box
   static Box<Conversation> _getBox() {
+    if (_useMetaOnly) return Hive.box<Conversation>(_webMetaBoxName);
     return Hive.box<Conversation>(_conversationBoxName);
+  }
+
+  /// Strip message payloads (incl. base64 image blobs) before persisting a
+  /// conversation on web. The in-memory list keeps the full messages for the
+  /// current session; the persisted copy is metadata only.
+  static Conversation _metaOnly(Conversation conversation) {
+    return Conversation(
+      id: conversation.id,
+      title: conversation.title,
+      lastMessageAt: conversation.lastMessageAt,
+      modelSelected: conversation.modelSelected,
+      createdAt: conversation.createdAt,
+      messages: const [],
+      miniApp: conversation.miniApp,
+      folder: conversation.folder,
+      icon: conversation.icon,
+      stateString: conversation.stateString,
+      triggerId: conversation.triggerId,
+      triggerType: conversation.triggerType,
+    );
   }
 
   // CRUD OPERATIONS
 
-  // Get all conversations
+  // Get all conversations (metadata only on web)
   static List<Conversation> getAllConversations() {
     final box = _getBox();
     final list = box.values.toList();
@@ -117,15 +146,25 @@ class ConversationStorage {
   // Save a conversation
   static Future<void> saveConversation(Conversation conversation) async {
     final box = _getBox();
+    // On web, persist only metadata so IndexedDB never holds message blobs.
+    if (_useMetaOnly) {
+      await box.put(conversation.id, _metaOnly(conversation));
+      return;
+    }
     await box.put(conversation.id, conversation);
   }
 
+  /// Merge server-provided conversation list into local storage.
+  /// Web: merge only the lightweight metadata; message histories are fetched
+  /// from the server per open and never persisted.
   static Future<void> mergeConversations(
     List<Conversation> conversations,
   ) async {
     final box = _getBox();
     for (var conversation in conversations) {
-      if (box.containsKey(conversation.id)) {
+      if (_useMetaOnly) {
+        conversation = _metaOnly(conversation);
+      } else if (box.containsKey(conversation.id)) {
         // Preserve local messages when the server response has none
         // (the list endpoint strips messages for efficiency)
         final existing = box.get(conversation.id)!;
@@ -174,9 +213,9 @@ class ConversationStorage {
     final conversation = getConversation(conversationId);
     if (conversation == null) return null;
 
-    if (title != "" && title != null) conversation.title = title;
+    if (title != '' && title != null) conversation.title = title;
 
-    if (icon != "" && icon != null) conversation.icon = icon;
+    if (icon != '' && icon != null) conversation.icon = icon;
 
     if (modelSelected != null) conversation.modelSelected = modelSelected;
 
@@ -225,5 +264,4 @@ class ConversationStorage {
 
     return conversation;
   }
-
 }

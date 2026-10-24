@@ -107,6 +107,15 @@ class ConversationStatus {
   bool get isIdle => state == 'idle';
   bool get isTyping => activity == 'typing';
   bool get isUsingTool => activity == 'tool_use';
+
+  /// Whether two statuses are equivalent for UI purposes. The server often
+  /// re-broadcasts the same state (e.g. a ModelSelected-only refresh while
+  /// the conversation is still "typing"); treating those as equal lets
+  /// callers skip redundant notifier updates / rebuilds.
+  bool sameAs(ConversationStatus other) =>
+      state == other.state &&
+      activity == other.activity &&
+      toolName == other.toolName;
 }
 
 /// ChatService is a singleton background service that manages all chat
@@ -165,6 +174,17 @@ class ChatService {
   /// Reference to the conversations notifier (set during app init).
   ConversationsNotifier? _conversationsNotifier;
 
+  /// When the last status event arrived. Used by the idle watchdog: if the
+  /// tab was backgrounded and Firefox parked the SSE socket, no events will
+  /// arrive here even though the server is broadcasting. A silent status
+  /// stream for longer than [statusStreamIdleTimeout] while we believe a
+  /// conversation is active means the socket died without firing onError —
+  /// tear it down and reconnect, which re-broadcasts current state and lets
+  /// the status handler reattach the per-conversation SSE below.
+  DateTime _lastStatusEventAt = DateTime.now();
+  Timer? _statusWatchdogTimer;
+  static const _statusStreamIdleTimeout = Duration(seconds: 45);
+
   void setConversationsNotifier(ConversationsNotifier notifier) {
     _conversationsNotifier = notifier;
   }
@@ -204,6 +224,17 @@ class ChatService {
       conversationId,
       () => ValueNotifier(const ChatSessionState()),
     );
+  }
+
+  /// Release the memory held by a closed conversation's session (its
+  /// streaming `items` list can hold every tool call / text chunk from a long
+  /// run). Called on sign-out and when the UI closes a conversation. No-op for
+  /// conversations with a live SSE stream attached.
+  void disposeSession(String conversationId) {
+    if (conversationId.isEmpty) return;
+    if (_activeStreams.containsKey(conversationId)) return;
+    final session = _sessions.remove(conversationId);
+    session?.dispose();
   }
 
   /// Send a new user message. Connects to the SSE stream automatically.
@@ -434,22 +465,20 @@ class ChatService {
   /// Safe to call on conversation open, on SSE error, and on app resume.
   /// If the server has no active stream, resolves the session to idle and
   /// clears any stale entry in [conversationStatuses].
-  Future<void> reconnect(String conversationId) async {
+  ///
+  /// [force] bypasses the "already processing" bail. That guard exists to
+  /// avoid racing a sendMessage/submitToolResults whose POST is in flight —
+  /// but a session can be stuck `processing` with a DEAD socket. force is
+  /// the recovery path used on tab visibility / app resume.
+  Future<void> reconnect(String conversationId, {bool force = false}) async {
     if (conversationId.isEmpty) return;
     // Not logged in (or torn down on sign-out) — never touch the network.
-    // Otherwise a reconnect scheduled before logout would fire afterwards
-    // with a stale/absent token and 401 against the server.
     if (!_connected) return;
     if (_activeStreams.containsKey(conversationId)) return;
-    // Another caller is already attaching — wait for it instead of racing.
     if (_connecting.contains(conversationId)) return;
-    // sendMessage / submitToolResults set state=processing synchronously
-    // before awaiting their POST. While that POST is in flight we don't
-    // have an entry in _activeStreams yet, but reconnecting would race the
-    // POST's stream with our /chat/stream/<id> stream — and the server
-    // would fan every event to both sockets. Bail.
     final existing = _sessions[conversationId];
-    if (existing != null &&
+    if (!force &&
+        existing != null &&
         existing.value.state == ConversationState.processing) {
       return;
     }
@@ -457,8 +486,6 @@ class ChatService {
     _connecting.add(conversationId);
     try {
       final stream = await _api.connectStream(conversationId);
-      // Live stream — flip session to processing so the UI shows activity
-      // immediately rather than waiting for the first event.
       final session = getSession(conversationId);
       session.value = session.value.copyWith(
         state: ConversationState.processing,
@@ -469,19 +496,40 @@ class ChatService {
         _handleUnauthorized();
         return;
       }
-      // No active stream on server — force local state to idle so a stale
-      // "processing" UI doesn't get stuck.
       final session = getSession(conversationId);
       session.value = session.value.copyWith(state: ConversationState.idle);
       _clearStatus(conversationId);
     } catch (_) {
-      // No active stream on server — force local state to idle so a stale
-      // "processing" UI doesn't get stuck.
       final session = getSession(conversationId);
       session.value = session.value.copyWith(state: ConversationState.idle);
       _clearStatus(conversationId);
     } finally {
       _connecting.remove(conversationId);
+    }
+  }
+
+  /// Reattach the currently-viewed conversation and refresh the global
+  /// status stream when the tab becomes visible again.
+  Future<void> reconnectVisible([String? conversationId]) async {
+    if (!_connected) return;
+
+    connectStatusStream();
+
+    if (conversationId != null && conversationId.isNotEmpty) {
+      await reconnect(conversationId, force: true);
+    } else {
+      // No explicit conversation: force-reconnect every session that is
+      // stuck processing without a live socket.
+      final stuck = <String>[];
+      for (final entry in _sessions.entries) {
+        if (entry.value.value.state == ConversationState.processing &&
+            !_activeStreams.containsKey(entry.key)) {
+          stuck.add(entry.key);
+        }
+      }
+      for (final id in stuck) {
+        await reconnect(id, force: true);
+      }
     }
   }
 
@@ -492,18 +540,32 @@ class ChatService {
     if (!current.containsKey(conversationId)) return;
     final updated = Map<String, ConversationStatus>.from(current);
     updated.remove(conversationId);
+    _setStatuses(updated);
+  }
+
+  /// Assign [conversationStatuses] only when the content actually changed.
+  void _setStatuses(Map<String, ConversationStatus> updated) {
+    final current = conversationStatuses.value;
+    if (current.length == updated.length) {
+      var same = true;
+      for (final entry in updated.entries) {
+        final existing = current[entry.key];
+        if (existing == null || !existing.sameAs(entry.value)) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return;
+    }
     conversationStatuses.value = updated;
   }
 
-  /// Called from the app lifecycle observer when the app resumes. The OS
-  /// may have severed the SSE sockets while backgrounded; flush the global
-  /// status stream so it (and the events it emits) can drive recovery. The
-  /// currently-viewed chat is reattached separately by the ChatInterface's
-  /// own lifecycle observer.
+  /// Called from the app lifecycle observer when the app resumes.
   Future<void> handleAppResumed() async {
     _statusStreamSubscription?.cancel();
     _statusStreamSubscription = null;
     connectStatusStream();
+    await reconnectVisible();
   }
 
   bool _connected = false;
@@ -516,13 +578,10 @@ class ChatService {
   }
 
   /// Tear down every live SSE/status stream and reset connection state.
-  /// Called on sign-out (and on a 401) so the retry loops below stop firing
-  /// with a stale or absent token — left running they spam the server with
-  /// unauthorized requests every few seconds and trip its brute-force
-  /// lockout, which is exactly what happens when the UI falls back to the
-  /// login screen mid-session.
   void disconnect() {
     _connected = false;
+    _statusWatchdogTimer?.cancel();
+    _statusWatchdogTimer = null;
     _statusStreamSubscription?.cancel();
     _statusStreamSubscription = null;
     for (final sub in _activeStreams.values) {
@@ -530,12 +589,15 @@ class ChatService {
     }
     _activeStreams.clear();
     _connecting.clear();
+    for (final session in _sessions.values) {
+      session.dispose();
+    }
+    _sessions.clear();
     conversationStatuses.value = {};
   }
 
   /// True when the current token was rejected (401). Forces a clean logout
-  /// instead of retrying — retrying a rejected token never succeeds and only
-  /// hammers the server.
+  /// instead of retrying.
   void _handleUnauthorized() {
     debugPrint('[ChatService] Token rejected (401) — signing out');
     disconnect();
@@ -544,32 +606,25 @@ class ChatService {
 
   /// Connect to the global status stream. Call once on app start (after auth).
   Future<void> connectStatusStream() async {
-    // Bail if we've been torn down (signed out). Without this the timer-based
-    // retries below keep reconnecting after logout with no valid token.
     if (!_connected) return;
 
-    // Refresh tool metadata cache
     await refreshToolMetadata();
 
-    // Re-check: refreshToolMetadata awaited, so a sign-out may have landed.
     if (!_connected) return;
 
-    // Cancel existing status stream if any
     _statusStreamSubscription?.cancel();
+
+    _lastStatusEventAt = DateTime.now();
+    _armStatusWatchdog();
 
     try {
       final stream = await _api.connectStatusStream();
       _statusStreamSubscription = stream.listen(
         (data) {
+          _lastStatusEventAt = DateTime.now();
           final conversationId = data['conversation_id'] as String? ?? '';
           if (conversationId.isEmpty) return;
 
-          // Any status event for an unknown conversation means the sidebar is
-          // stale — sub-agents and AI-created conversations don't go through
-          // the regular client-initiated SSE flow, so the conversation row
-          // never reaches local state otherwise. Refresh regardless of state
-          // (idle events fire for newly-created inert conversations and for
-          // sub-agents that finished between our last refresh and now).
           final known = _conversationsNotifier?.state.conversations
                   .any((c) => c.id == conversationId) ??
               false;
@@ -614,19 +669,8 @@ class ChatService {
           } else {
             updated[conversationId] = status;
           }
-          conversationStatuses.value = updated;
+          _setStatuses(updated);
 
-          // If the server says this conversation is processing but our SSE
-          // socket for it is gone (e.g. it died while we were backgrounded),
-          // reattach. Limited to conversations we already have a local
-          // session for — we don't want to spin up SSE streams for chats
-          // the user hasn't opened. reconnect() is a no-op when the stream
-          // is already healthy.
-          //
-          // Skip when the local session is already processing: that means
-          // sendMessage/submitToolResults set state=processing synchronously
-          // and is mid-await on the POST. Reconnecting here would race the
-          // POST's stream and double-up every event between the two sockets.
           if (!status.isIdle &&
               _sessions.containsKey(conversationId) &&
               !_activeStreams.containsKey(conversationId) &&
@@ -637,21 +681,15 @@ class ChatService {
         },
         onError: (e) {
           debugPrint('[ChatService] Status stream error: $e');
-          // Stop retrying once signed out — the timer would otherwise keep
-          // reconnecting with no valid token.
           if (!_connected) return;
-          // Reconnect after a delay
           Future.delayed(const Duration(seconds: 5), connectStatusStream);
         },
         onDone: () {
           if (!_connected) return;
-          // Stream closed — reconnect
           Future.delayed(const Duration(seconds: 2), connectStatusStream);
         },
       );
     } catch (e) {
-      // A rejected token (401) never recovers by retrying — it just hammers
-      // the server. Force a clean logout to the login screen instead.
       if (e is APIException && e.statusCode == 401) {
         _handleUnauthorized();
         return;
@@ -660,6 +698,24 @@ class ChatService {
       debugPrint('[ChatService] Failed to connect status stream: $e — retrying in 5s');
       Future.delayed(const Duration(seconds: 5), connectStatusStream);
     }
+  }
+
+  /// Idle watchdog for the global status stream.
+  void _armStatusWatchdog() {
+    _statusWatchdogTimer?.cancel();
+    _statusWatchdogTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (!_connected) return;
+      final hasActive = conversationStatuses.value.isNotEmpty ||
+          _activeStreams.isNotEmpty;
+      if (!hasActive) return;
+      final silentFor = DateTime.now().difference(_lastStatusEventAt);
+      if (silentFor < _statusStreamIdleTimeout) return;
+      debugPrint(
+          '[ChatService] Status stream silent for ${silentFor.inSeconds}s — reconnecting');
+      _statusStreamSubscription?.cancel();
+      _statusStreamSubscription = null;
+      connectStatusStream();
+    });
   }
 
   // --- Internal ---
@@ -672,8 +728,6 @@ class ChatService {
   }) {
     _disconnectSSE(initialConversationId);
 
-    // Use a mutable reference so re-keying in _handleSSEEvent is reflected
-    // in subsequent events from the same listener.
     String currentId = initialConversationId;
 
     final subscription = stream.listen(
@@ -687,15 +741,9 @@ class ChatService {
           state: ConversationState.idle,
           error: error.toString(),
         );
-        // Unblock any new-conversation send waiting on the server-assigned id;
-        // without this the awaiting sendMessage future would hang forever.
         final completer = _pendingIdCompleters.remove(currentId);
         if (completer != null && !completer.isCompleted) completer.complete(null);
         _activeStreams.remove(currentId);
-        // After a transient socket abort (e.g. phone locked, network blip)
-        // the conversation may still be running server-side. Try to reattach
-        // shortly; reconnect() falls through to idle if the server says
-        // there's no active stream.
         _clearStatus(currentId);
         final convId = currentId;
         Future.delayed(const Duration(seconds: 2), () {
@@ -734,10 +782,6 @@ class ChatService {
       final realId = event.conversationId;
       session.value = session.value.copyWith(resolvedConversationId: realId);
 
-      // Create the conversation in local state. The model_selected payload
-      // (which carries the per-conversation tool toggles and the attached
-      // folder path) is round-tripped server-side, so the local row will
-      // hydrate naturally on the next loadConversation.
       if (modelSelected != null) {
         _conversationsNotifier?.createConversation(
           id: realId,
@@ -747,14 +791,12 @@ class ChatService {
         );
       }
 
-      // Re-key the session and stream under the real ID
       _sessions[realId] = session;
       _sessions.remove(conversationId);
       if (_activeStreams.containsKey(conversationId)) {
         _activeStreams[realId] = _activeStreams.remove(conversationId)!;
       }
 
-      // Complete the pending ID completer so the UI can navigate
       final completer = _pendingIdCompleters.remove(conversationId);
       if (completer != null && !completer.isCompleted) {
         completer.complete(realId);
@@ -768,13 +810,6 @@ class ChatService {
       session.value = session.value.copyWith(title: event.title);
     }
 
-    // Sync per-conversation settings (tools / folder / eco / client lock)
-    // from any server event that carries the snapshot. The server stamps
-    // model_selected on tool_use and done events; here we mirror that into
-    // the local conversation in Riverpod so UI watchers (lock badge,
-    // banner, eco toggle, folder chip) reflect the freshest state — and
-    // so a passively-viewing client sees the lock holder *before* it
-    // would otherwise race to execute the same client-side tool.
     if (event.modelSelected != null) {
       _conversationsNotifier?.updateConversationMetaData(
         conversationId: conversationId,
@@ -784,7 +819,6 @@ class ChatService {
 
     switch (event.type) {
       case 'text':
-        // Append to the current text item, or create one if the last item isn't text
         final items = List<StreamItem>.from(session.value.items);
         if (items.isNotEmpty && items.last.type == 'text') {
           items[items.length - 1] = StreamItem(
@@ -809,11 +843,9 @@ class ChatService {
           isServer: event.isServer,
         ));
         if (event.toolCall != null) {
-          // Check if this tool is in "ask" mode — if so, don't auto-queue it
           final toolsMap = modelSelected?.text?.tools;
           final isAsk = toolsMap != null && toolsMap[event.toolCall!.function.name] == 'ask';
           if (isAsk) {
-            // Just add to items — the approval banner derives from DB state
             session.value = session.value.copyWith(items: items);
           } else if (event.isServer) {
             session.value = session.value.copyWith(items: items);
@@ -843,14 +875,6 @@ class ChatService {
 
         if (newState == ConversationState.waitingForTool &&
             session.value.pendingClientTools.isNotEmpty) {
-          // The modelSelected parameter is the one captured when this SSE
-          // stream was opened. It's null whenever the stream was attached
-          // via reconnect() — most importantly when another client sent
-          // the message and we hopped onto its ActiveRequest via the
-          // status stream. In that case fall back to the live conversation
-          // in Riverpod (kept fresh by the model_selected stamped on every
-          // tool_use / done event). Without this fallback the lock holder
-          // receives the tool call but never dispatches it.
           ModelSelected? effective = modelSelected;
           if (effective == null) {
             final convs = _conversationsNotifier?.state.conversations;
@@ -866,7 +890,6 @@ class ChatService {
           if (effective != null) {
             _executeClientTools(conversationId, effective);
           }
-          // If pendingAskTools is non-empty, the UI will show an approval banner
         }
         break;
 
@@ -879,8 +902,6 @@ class ChatService {
           state: ConversationState.idle,
           error: event.content,
         );
-        // A new-conversation send awaits the server-assigned id; complete it so
-        // the awaiting future resolves (null) instead of hanging on failure.
         final completer = _pendingIdCompleters.remove(conversationId);
         if (completer != null && !completer.isCompleted) {
           completer.complete(null);
@@ -907,8 +928,7 @@ class ChatService {
   }
 
   /// Strict-validate args for a client-side tool call against its declared
-  /// schema. Returns null when valid, or an LLM-facing error string. Mirrors
-  /// the server's ai_tools.ValidateToolCallArgs.
+  /// schema. Returns null when valid, or an LLM-facing error string.
   String? _validateClientToolArgs(
     ToolCall toolCall,
     List<Map<String, dynamic>> defs,
@@ -961,20 +981,6 @@ class ChatService {
   ) async {
     final session = getSession(conversationId);
 
-    // Client-lock gate. The conversation can only have one machine
-    // dispatching its client-side tools at a time. Other connected
-    // clients still receive the tool_use events (so the stream stays
-    // visible in the UI) but must skip execution — the locked client
-    // will submit the results and the server doesn't care which
-    // client posts them.
-    //
-    // Important: we re-read the lock from Riverpod rather than trusting
-    // the `modelSelected` argument the caller captured when starting the
-    // request. The server stamps the current lock onto tool_use events,
-    // and our SSE handler mirrors that into Riverpod *before* the
-    // state_change → waitingForTool that triggers this method. So the
-    // fresh read is what closes the race when another client has just
-    // claimed the conversation.
     Conversation? liveConv;
     final convs = _conversationsNotifier?.state.conversations;
     if (convs != null) {
@@ -990,18 +996,10 @@ class ChatService {
     final myId = ClientIdentity().id;
     final lock = liveModelSelected.clientLock;
     if (lock != null && myId.isNotEmpty && lock.id != myId) {
-      // Drop the queued calls so we don't try to re-dispatch them on the
-      // next state_change. The locked client's submission will advance
-      // the conversation.
       session.value =
           session.value.copyWith(pendingClientTools: const []);
       return;
     }
-    // Adopt the live model so any folder / eco / tool changes pushed by
-    // the server are honoured during this execution too. Lock acquisition
-    // itself is deferred until the tool-results submission below — that's
-    // the moment we actually claim ownership over the wire, and the
-    // server arbitrates if two clients race.
     modelSelected = liveModelSelected;
 
     final toolCalls = List<ToolCall>.from(session.value.pendingClientTools);
@@ -1019,7 +1017,6 @@ class ChatService {
         continue;
       }
       try {
-        // Handle retrieve_skill locally (not an MCP tool)
         if (toolCall.function.name == 'retrieve_skill') {
           final args = jsonDecode(
             toolCall.function.arguments.isEmpty
@@ -1038,8 +1035,6 @@ class ChatService {
           continue;
         }
 
-        // Device-side filesystem tools (sandboxed to the conversation's
-        // attached folder).
         if (toolCall.function.name == FilesystemService.readToolName ||
             toolCall.function.name == FilesystemService.writeToolName) {
           final args = jsonDecode(
@@ -1059,8 +1054,6 @@ class ChatService {
           continue;
         }
 
-        // Device-side shell. cwd defaults to the attached folder if set,
-        // else the user's home directory; absolute pwd values are honored.
         if (toolCall.function.name == ShellService.toolName) {
           final args = jsonDecode(
             toolCall.function.arguments.isEmpty
@@ -1114,15 +1107,6 @@ class ChatService {
     }
 
     if (results.isNotEmpty) {
-      // Stamp this client as the lock holder on the outgoing modelSelected.
-      // The server's PushMessage will persist this, and the next SSE event
-      // back (tool_use / done with model_selected) will mirror it into
-      // Riverpod on every viewer — including us — so the badge appears
-      // without a separate local write. If two clients race to reply, the
-      // POST that lands last wins and the loser's local lock state is
-      // overwritten by the server's reply, which is the correct UX.
-      // We also do an optimistic local update so the badge surfaces
-      // immediately on this client without waiting for the round-trip.
       final claim = ClientIdentity().asLock();
       if (claim != null &&
           (modelSelected.clientLock == null ||
@@ -1134,7 +1118,6 @@ class ChatService {
         );
       }
 
-      // Add tool result messages to local state
       for (final result in results) {
         _conversationsNotifier?.addMessage(
           conversationId: conversationId,
@@ -1151,9 +1134,6 @@ class ChatService {
   }
 
   /// Handle user approval/denial of "ask" tools.
-  /// [decisions] maps tool call ID → approved (true/false).
-  /// Server-side tools are sent to /chat/approve (server executes + relaunches loop).
-  /// Client-side tools are executed locally and submitted via HandleChat + ToolResults.
   Future<void> approveTools({
     required String conversationId,
     required ModelSelected modelSelected,
@@ -1167,7 +1147,6 @@ class ChatService {
       state: ConversationState.processing,
     );
 
-    // Split into server-side and client-side tools
     final serverApprovals = <Map<String, dynamic>>[];
     final clientAskTools = <ToolCall>[];
 
@@ -1191,7 +1170,6 @@ class ChatService {
       }
     }
 
-    // Handle client-side ask tools locally
     final clientResults = <Message>[];
     final clientToolDefs = _currentClientToolDefs(modelSelected);
     for (final toolCall in clientAskTools) {
@@ -1264,21 +1242,17 @@ class ChatService {
       }
     }
 
-    // If there are server-side approvals, use /chat/approve (it relaunches the loop)
     if (serverApprovals.isNotEmpty) {
-      // If we also have client results, submit those first via HandleChat
       if (clientResults.isNotEmpty) {
         for (final result in clientResults) {
           _conversationsNotifier?.addMessage(conversationId: conversationId, message: result);
         }
-        // Push client results to DB without relaunching loop
         await submitToolResults(
           conversationId: conversationId,
           toolResults: clientResults,
           modelSelected: modelSelected,
         );
       }
-      // Then approve server tools (this relaunches the loop + SSE)
       try {
         final skillNames = _skills.getSkillNames();
         final attachedFolder = _folderFromModel(modelSelected);
@@ -1302,7 +1276,6 @@ class ChatService {
         );
       }
     } else if (clientResults.isNotEmpty) {
-      // Only client-side tools — submit via existing HandleChat + ToolResults
       for (final result in clientResults) {
         _conversationsNotifier?.addMessage(conversationId: conversationId, message: result);
       }
@@ -1319,17 +1292,13 @@ class ChatService {
     final session = getSession(conversationId);
     final resolvedId = session.value.resolvedConversationId ?? conversationId;
 
-    // Reset session state
     session.value = ChatSessionState(
       state: ConversationState.idle,
       resolvedConversationId: session.value.resolvedConversationId,
     );
 
-    // Reload conversation from server to get the full DB-saved messages
     if (resolvedId.isNotEmpty) {
       _conversationsNotifier?.loadConversation(resolvedId);
     }
-
-    // Title generation is now handled server-side and pushed via the status stream
   }
 }

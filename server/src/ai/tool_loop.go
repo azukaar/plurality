@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +30,44 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 
 	utils.Log("[LLMLoop] Starting for conversation %s with %d connected clients", ar.ConversationID, ar.ClientCount())
 
+	// Runaway-loop guard: count LLM iterations in this request. A workflow
+	// can legitimately loop dozens to hundreds of times (tool → LLM → tool
+	// …) while making real progress — e.g. a 60-iteration continue-turn was
+	// observed on 2026-10-14 where the previous hard cap of 60 halted a
+	// conversation mid-task (screenshots, history rewrite, PR prep all
+	// done; the guard killed it before the final store PR update). A stuck
+	// conversation, by contrast, repeats the *same* tool call against a
+	// conversation that never changes. We can't cheaply detect "same" here,
+	// so the cap exists purely to bound the damage (observed pre-#56:
+	// "Cosmos Init Refactor" ran for hours, pushing ~5,000 messages and a
+	// 550 MB WAL before the container was killed).
+	//
+	// Budget is configurable via MAX_LOOP_ITERATIONS and defaults well above
+	// any observed healthy turn, so legitimate long runs are not interrupted.
+	// WAL checkpointing (#56) keeps disk churn bounded while a run is in
+	// progress. The long_task reminder cap (LongTaskMaxReminders) bounds the
+	// "keep going" nudge path; this bounds everything else.
+	maxLoopIterations := maxLoopIterationsFromEnv()
+	iterations := 0
+
+	// Zero-progress stall guard: a healthy loop persists at least one
+	// message per iteration (the streamed assistant message plus any tool
+	// results). A stuck conversation — the model re-emitting the same tool
+	// calls that were already dropped as duplicates, tools failing before
+	// anything reaches the DB, or a provider returning empty completions
+	// with tool calls — can spin the LLM loop back-to-back with no
+	// persisted growth. MAX_LOOP_ITERATIONS bounds it eventually, but each
+	// iteration is a full provider round-trip plus JSON/DB work, so 150 hot
+	// iterations still burn several minutes of whole cores (observed: a
+	// production instance pinned at ~415% CPU for 24h+). Halt a few
+	// consecutive zero-progress iterations in instead and let the user
+	// resume.
+	//
+	// Configurable per-deployment via LOOP_PROGRESS_STALL_LIMIT, mirroring
+	// MAX_LOOP_ITERATIONS.
+	progressStallLimit := progressStallLimitFromEnv()
+	zeroProgressStreak := 0
+
 	for {
 		select {
 		case <-ar.Ctx.Done():
@@ -35,6 +75,29 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 			return
 		default:
 		}
+
+		iterations++
+		if iterations > maxLoopIterations {
+			utils.Log("[LLMLoop] iteration budget (%d) exceeded for conversation %s after %d productive iterations — going idle (runaway loop guard)", maxLoopIterations, ar.ConversationID, iterations-1)
+			ar.Broadcast(SSEEvent{
+				Type:           "text",
+				Content:        fmt.Sprintf("(This turn exceeded the %d-step loop budget and was paused to guard against a runaway loop. If work was still in progress, send a message to continue — the state is preserved.)", maxLoopIterations),
+				ConversationID: ar.ConversationID,
+			})
+			ar.setState(ctx, utils.StateIdle)
+			ar.BroadcastStatus("", "")
+			ar.Broadcast(SSEEvent{
+				Type:           "done",
+				ConversationID: ar.ConversationID,
+				Title:          conversation.Title,
+			})
+			return
+		}
+
+		// Snapshot the persisted-message count at the start of this
+		// iteration. After the stream + tool execution, growth means real
+		// forward progress; no growth means the loop is spinning.
+		iterStartMsgCount := len(conversation.Messages)
 
 		model := SelectModel(payload.ModelSelected, conversation)
 		ar.Model = model
@@ -47,6 +110,27 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 			if ar.Ctx.Err() != nil {
 				ar.flushPartialResponse(ctx, conversation)
 				return
+			}
+			if isContextLengthError(err) {
+				// The conversation outgrew the model's context window. Shrink
+				// the in-memory history and retry ONCE — otherwise a long
+				// conversation (this one hit 381k tokens vs 131k limit)
+				// dead-ends into an error/blank UI at workflow end.
+				utils.Error("[LLMLoop] context length exceeded — compacting history and retrying", err)
+				before := len(conversation.Messages)
+				conversation.Messages = CompactConversationForContext(conversation.Messages, 24)
+				after := len(conversation.Messages)
+				utils.Log("[LLMLoop] compacted conversation %s history %d -> %d messages", ar.ConversationID, before, after)
+				if after < before {
+					ar.Broadcast(SSEEvent{
+						Type:           "text",
+						Content:        "(The conversation was too long for the model's context window — older messages were compacted. Retrying …)",
+						ConversationID: ar.ConversationID,
+					})
+					continue
+				}
+				// Compaction left the history unchanged — fall through to the
+				// error path rather than looping forever.
 			}
 			utils.Error("[LLMLoop] Error calling LLM", err)
 			ar.Broadcast(SSEEvent{
@@ -68,6 +152,19 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 				ar.flushPartialResponse(ctx, conversation)
 				return
 			}
+			// The stream ended in an error (e.g. SSE idle timeout after 90s
+			// without bytes — see idleTimeoutReader). Do NOT log "Stream
+			// complete" and do NOT loop back: mark the turn errored and go
+			// idle so the UI shows the failure instead of hanging forever
+			// with the conversation stuck in "processing".
+			ar.setState(ctx, utils.StateIdle)
+			ar.BroadcastStatus("", "")
+			ar.Broadcast(SSEEvent{
+				Type:           "error",
+				Content:        err.Error(),
+				ConversationID: ar.ConversationID,
+			})
+			return
 		}
 
 		utils.Log("[LLMLoop] Stream complete. Text length: %d, Tool calls: %d", len(ar.TextBuffer.String()), len(assistantMessage.ToolCalls))
@@ -139,12 +236,24 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 			return
 		}
 
-		// Drop tool calls that already have a tool result in the conversation —
-		// the stream processor pushes synthetic failure results for tool calls
+		// Drop tool calls that already have a tool result in THIS TURN — the
+		// stream processor pushes synthetic failure results for tool calls
 		// whose args were truncated, so re-dispatching them here would just
-		// produce duplicate results in DB.
-		existingResults := make(map[string]bool, len(conversation.Messages))
-		for _, m := range conversation.Messages {
+		// produce duplicate results in DB. Scope to the turn: providers reuse
+		// short tool-call ids ("call_0") across turns, so a whole-history
+		// lookup would wrongly treat every old "call_0" result as this turn's
+		// result and drop the fresh call — the workflow then re-issues the
+		// same call forever (crash loop). Unique minted ids make the
+		// turn-scoped lookup exact.
+		existingResults := make(map[string]bool, len(assistantMessage.ToolCalls))
+		// The last user message demarcates this turn: only tool results
+		// persisted after it belong to the calls we just received. Results
+		// from earlier turns (same provider id "call_0") must never count.
+		for i := len(conversation.Messages) - 1; i >= 0; i-- {
+			m := conversation.Messages[i]
+			if m.Role == "user" {
+				break
+			}
 			if m.Role == "tool" && m.ToolCallID != "" {
 				existingResults[m.ToolCallID] = true
 			}
@@ -384,12 +493,160 @@ func (ar *ActiveRequest) RunLLMLoop(ctx context.Context, conversation utils.Conv
 				ConversationID: ar.ConversationID,
 				ModelSelected:  &doneSnap,
 			})
-			return // Wait for client to POST tool results or approvals
+			// Wait for the client to POST tool results / approvals — but not
+			// forever. A disconnected or unresponsive client would otherwise
+			// strand this conversation in waiting_for_tool / waiting_for_approval
+			// indefinitely (observed: "Modbus Template Updates" sat parked for
+			// 9+ hours on 2026-09-29→30 because the shell_client__exec result
+			// from seq 4274 never arrived). Arm a stall watchdog that
+			// synthesizes a timeout result and resumes the loop, so the model
+			// can self-correct (e.g. fall back to a server-side tool).
+			go armClientToolWatchdog(userContextFor(ar.UserID), ar, &conversation, clientTools)
+			return
+		}
+
+		// Zero-progress stall detection. If this iteration persisted nothing
+		// (conversation.Messages did not grow), and we are about to loop
+		// back to the LLM anyway, treat consecutive repeats as a stuck spin.
+		// Legitimate progress always persists at least the assistant message
+		// (finalizeStream) and every executed tool result, so any healthy
+		// workflow resets the streak every iteration.
+		if len(conversation.Messages) == iterStartMsgCount {
+			zeroProgressStreak++
+		} else {
+			zeroProgressStreak = 0
+		}
+		if zeroProgressStreak >= progressStallLimit {
+			utils.Log("[LLMLoop] zero-progress stall: %d consecutive iteration(s) persisted no messages for conversation %s — going idle (stall guard)", zeroProgressStreak, ar.ConversationID)
+			ar.Broadcast(SSEEvent{
+				Type:           "text",
+				Content:        fmt.Sprintf("(This conversation stopped making progress after %d step(s) — the loop was paused to stop burning resources. If work was still in progress, send a message to continue — the state is preserved.)", progressStallLimit),
+				ConversationID: ar.ConversationID,
+			})
+			ar.setState(ctx, utils.StateIdle)
+			ar.BroadcastStatus("", "")
+			ar.Broadcast(SSEEvent{
+				Type:           "done",
+				ConversationID: ar.ConversationID,
+				Title:          conversation.Title,
+			})
+			return
 		}
 
 		// All tools were server-side — loop back to LLM with results
 		utils.Log("[LLMLoop] All server tools executed, looping back to LLM")
 	}
+}
+
+// clientToolStallTimeout is how long the LLM loop waits for a client-side
+// tool result before the stall watchdog synthesizes a timeout and resumes.
+const clientToolStallTimeout = 90 * time.Second
+
+// armClientToolWatchdog runs in the background while the LLM loop is parked
+// waiting for the client to POST results for client-side tools. If the client
+// never delivers (disconnected tab, missed event, offline device), the
+// conversation would otherwise sit in waiting_for_tool / waiting_for_approval
+// indefinitely — the "Modbus Template Updates" stall on 2026-09-29→30 (a
+// shell_client__exec result from seq 4274 never arrived; the conversation
+// sat parked 21:42 → 06:55 until a fresh user message poked it back to life).
+//
+// On timeout it pushes a synthetic "Client did not respond within 90s" tool
+// result for every still-outstanding client tool call, then re-launches the
+// LLM loop exactly like a client tool_results POST would (HandleChat /
+// HandleApprove path). The model sees the timeout and can self-correct —
+// e.g. fall back to a server-side tool — instead of stalling forever.
+func armClientToolWatchdog(ctx context.Context, ar *ActiveRequest, conv *utils.Conversation, clientTools []utils.ToolCall) {
+	select {
+	case <-time.After(clientToolStallTimeout):
+	case <-ar.Ctx.Done():
+		return // cancelled or superseded
+	}
+
+	// Re-check: only synthesize results for tool calls that still have no
+	// matching tool row in the DB (the client may have delivered late).
+	outstanding := make([]utils.ToolCall, 0, len(clientTools))
+	for _, tc := range clientTools {
+		if !hasToolResult(ctx, conv.ID, tc.ID) {
+			outstanding = append(outstanding, tc)
+		}
+	}
+	if len(outstanding) == 0 {
+		return // everything arrived — nothing to do
+	}
+
+	utils.Log("[LLMLoop] client tool stall: %d tool call(s) unanswered for %v — synthesizing timeout result", len(outstanding), clientToolStallTimeout)
+
+	// Load the freshest conversation (may contain late client results or a
+	// new user message from another tab).
+	cur, err := db.GetConversationByIdInternal(ctx, conv.ID)
+	if err != nil {
+		utils.Error("[LLMLoop] client tool watchdog: could not reload conversation", err)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	for _, tc := range outstanding {
+		// Skip if a tool row for this call appeared while we were waiting.
+		if hasToolResult(ctx, cur.ID, tc.ID) {
+			continue
+		}
+		toolMsg := utils.Message{
+			Role:       "tool",
+			Content:    utils.NewTextContent("Client did not respond within " + clientToolStallTimeout.String() + ". The client-side tool was not executed. If this task still needs doing, retry with a server-side tool (e.g. system_tools__shell_exec) or ask the user."),
+			ToolCallID: tc.ID,
+			Name:       tc.Function.Name,
+			Timestamp:  now,
+		}
+		updated, _, pushErr := db.PushMessage(ctx, *cur, toolMsg)
+		if pushErr != nil {
+			utils.Error("[LLMLoop] client tool watchdog: failed to push timeout result", pushErr)
+			continue
+		}
+		cur = &updated
+	}
+
+	// Re-launch the loop (mirrors HandleChat / HandleApprove). The old
+	// ActiveRequest was already cleaned up when its loop returned, so a new
+	// one is safe to register.
+	model := SelectModel(ar.ModelSelected, *cur)
+	persistCtx := userContextFor(ar.UserID)
+	newAR := NewActiveRequest(cur.ID, ar.UserID, model, ar.ModelSelected)
+	cancelCtx, cancelFunc := context.WithCancel(persistCtx)
+	newAR.Ctx = cancelCtx
+	newAR.Cancel = cancelFunc
+	// Atomically claim the resume slot: if the client (or a new /chat)
+	// already registered a fresh request while we were synthesizing results,
+	// that loop is authoritative and this watchdog must stand down.
+	if !RequestRegistry.SetIfAbsent(cur.ID, newAR) {
+		utils.Log("[LLMLoop] client tool watchdog: conversation %s already has an active request — standing down", cur.ID)
+		return
+	}
+	if err := db.UpdateConversationState(persistCtx, cur.ID, utils.StateProcessing); err != nil {
+		utils.Error("[LLMLoop] client tool watchdog: error setting state", err)
+	}
+
+	utils.Log("[LLMLoop] client tool watchdog: resuming conversation %s with %d timeout result(s)", cur.ID, len(outstanding))
+	newAR.RunLLMLoop(persistCtx, *cur, ChatPayload{
+		ConversationID:  cur.ID,
+		ModelSelected:   ar.ModelSelected,
+		ClientSideTools: nil,
+		AvailableSkills: nil,
+	})
+}
+
+// hasToolResult reports whether a tool row with the given tool_call_id exists
+// for the conversation (used to avoid double-synthesizing late-arriving results).
+func hasToolResult(ctx context.Context, conversationID string, toolCallID string) bool {
+	conv, err := db.GetConversationByIdInternal(ctx, conversationID)
+	if err != nil {
+		return false
+	}
+	for _, m := range conv.Messages {
+		if m.Role == "tool" && m.ToolCallID == toolCallID {
+			return true
+		}
+	}
+	return false
 }
 
 // enrichToolCallMetadata populates the Loading and IconURL fields from the tool registry.
@@ -548,7 +805,7 @@ func (ar *ActiveRequest) setState(ctx context.Context, state utils.ConversationS
 
 // flushPartialResponse saves whatever text was produced so far to the DB on cancellation.
 func (ar *ActiveRequest) flushPartialResponse(ctx context.Context, conversation utils.Conversation) {
-	text := ar.TextBuffer.String()
+	text := strings.TrimSpace(ar.TextBuffer.String())
 	if text == "" {
 		ar.setState(ctx, utils.StateIdle)
 		ar.BroadcastStatus("", "")
@@ -593,8 +850,13 @@ func injectLongTaskReminder(ctx context.Context, ar *ActiveRequest, conv *utils.
 		return false
 	}
 	if state.RemindersUsed >= ai_tools.LongTaskMaxReminders {
-		utils.Log("[LLMLoop] long_task reminder cap (%d) reached, going idle with %d open task(s)", ai_tools.LongTaskMaxReminders, openCount(state))
-		return false
+		// Reminder cap reached with outstanding tasks. Do NOT go silently
+		// idle: the LLM would keep answering with empty text (no tool calls,
+		// no reminder, no work) and the conversation looks dead to the user.
+		// Instead, auto-pause the list and surface an explanatory message so
+		// the user sees why work stopped and the LLM can resume/clear the
+		// list on the next turn.
+		return pauseBlockedLongTask(ctx, ar, conv, state)
 	}
 
 	state.RemindersUsed++
@@ -659,6 +921,76 @@ func injectLongTaskReminder(ctx context.Context, ar *ActiveRequest, conv *utils.
 
 	utils.Log("[LLMLoop] long_task reminder injected (%d/%d), %d open task(s)", state.RemindersUsed, ai_tools.LongTaskMaxReminders, len(open))
 	return true
+}
+
+// pauseBlockedLongTask resolves a long_task list whose reminder budget has
+// been exhausted while tasks are still open. Left as-is, every subsequent
+// turn ends with an empty completion ("Text length: 0, Tool calls: 0") and
+// the conversation silently goes idle — the user sees no work and no error.
+//
+// This auto-pauses the list with a reason and pushes a plain assistant
+// message explaining what happened, so:
+//   - the user sees a real (non-empty) final message instead of a dead turn
+//   - the persisted state flips to Paused, which stops the nudge loop
+//   - on the next user turn the LLM sees the paused list in context and can
+//     call long_task resume/clear (or the user can tell it to)
+//
+// Returns false: the caller should proceed to idle (the explanatory message
+// is already in the conversation).
+func pauseBlockedLongTask(ctx context.Context, ar *ActiveRequest, conv *utils.Conversation, state ai_tools.LongTaskState) bool {
+	open := openTitles(state)
+
+	state.Paused = true
+	state.PauseReason = "reminder cap reached; tasks left open across " + strconv.Itoa(state.RemindersUsed) + " reminders"
+	state.Nudge = ""
+	resultBody := ai_tools.FormatStateJSON(state)
+
+	assistantMsg := utils.Message{
+		Role: "assistant",
+		Content: utils.NewTextContent(fmt.Sprintf(
+			"The following open task(s) could not be completed after %d reminders: %s. The task list has been automatically paused. Say \"continue\" to resume, or give new instructions.",
+			state.RemindersUsed,
+			strings.Join(open, "; "),
+		)),
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	// Persist the paused state as a synthetic long_task tool result so the
+	// LLM sees it on the next turn, plus the explanatory assistant message.
+	syntheticID := fmt.Sprintf("longtask_paused_%d", time.Now().UnixNano())
+	toolMsg := utils.Message{
+		Role:       "tool",
+		Content:    utils.NewTextContent(resultBody),
+		ToolCallID: syntheticID,
+		Name:       "long_task",
+		Timestamp:  time.Now().Format(time.RFC3339),
+	}
+
+	updated, _, err := db.PushMessage(ctx, *conv, assistantMsg)
+	if err == nil {
+		updated, _, err = db.PushMessage(ctx, updated, toolMsg)
+	}
+	if err != nil {
+		utils.Error("[LLMLoop] long_task auto-pause: failed to persist state", err)
+		return false
+	}
+	*conv = updated
+
+	ar.Broadcast(SSEEvent{
+		Type:           "text",
+		Content:        assistantMsg.TextContent(),
+		ConversationID: ar.ConversationID,
+	})
+	ar.Broadcast(SSEEvent{
+		Type:           "tool_result",
+		ToolCallID:     syntheticID,
+		ToolName:       "long_task",
+		ToolResult:     resultBody,
+		IsServer:       true,
+		ConversationID: ar.ConversationID,
+	})
+
+	utils.Log("[LLMLoop] long_task auto-paused after reminder cap (%d/%d), %d open task(s): %s", state.RemindersUsed, ai_tools.LongTaskMaxReminders, len(open), strings.Join(open, "; "))
+	return false
 }
 
 func openTitles(s ai_tools.LongTaskState) []string {
@@ -759,4 +1091,43 @@ func pauseForWait(ctx context.Context, ar *ActiveRequest, conv *utils.Conversati
 	})
 
 	return true
+}
+
+// defaultMaxLoopIterations is the per-request LLM iteration budget for
+// RunLLMLoop. It is read once per loop start (so the env var can be tuned
+// without a rebuild) and can be overridden with MAX_LOOP_ITERATIONS — the
+// runaway-loop guard's safety valve must stay human-controllable.
+const defaultMaxLoopIterations = 150
+
+func maxLoopIterationsFromEnv() int {
+	v := os.Getenv("MAX_LOOP_ITERATIONS")
+	if v == "" {
+		return defaultMaxLoopIterations
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		utils.Log("[LLMLoop] ignoring invalid MAX_LOOP_ITERATIONS=%q, using default %d", v, defaultMaxLoopIterations)
+		return defaultMaxLoopIterations
+	}
+	return n
+}
+
+// defaultProgressStallLimit is how many consecutive LLM iterations may
+// persist zero messages before RunLLMLoop halts itself (see the zero-progress
+// stall guard in RunLLMLoop). Three is chosen to absorb transient single
+// no-op iterations (e.g. one duplicated tool call dropped) without letting a
+// real spin run on. Overridable with LOOP_PROGRESS_STALL_LIMIT.
+const defaultProgressStallLimit = 3
+
+func progressStallLimitFromEnv() int {
+	v := os.Getenv("LOOP_PROGRESS_STALL_LIMIT")
+	if v == "" {
+		return defaultProgressStallLimit
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		utils.Log("[LLMLoop] ignoring invalid LOOP_PROGRESS_STALL_LIMIT=%q, using default %d", v, defaultProgressStallLimit)
+		return defaultProgressStallLimit
+	}
+	return n
 }

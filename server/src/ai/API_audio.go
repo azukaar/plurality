@@ -171,7 +171,7 @@ func TranscribeAudio(audioData []byte, model string, language string, temperatur
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	// Send the request
-	client := &http.Client{}
+	client := utils.HTTPClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error sending request: %v", err)

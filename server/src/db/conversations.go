@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/azukaar/plurality/src/search"
@@ -67,9 +68,11 @@ func PushMessage(ctx context.Context, conversation utils.Conversation, message u
 			return utils.Conversation{}, false, err
 		}
 
-		// Async embedding for searchable messages
+		// Async embedding for searchable messages — serialized through the
+		// single embed worker (never a bare goroutine: N concurrent embeds
+		// on the SetMaxOpenConns(1) pool wedge the whole backend).
 		if message.Role == "user" || message.Role == "assistant" {
-			go search.EmbedMessage(db, LiteLLMBaseURL, msgID, message.TextContent())
+			search.EnqueueEmbed(db, LiteLLMBaseURL, "message", fmt.Sprintf("%d", msgID), message.TextContent())
 		}
 
 		utils.Log("Created new conversation ID: %s for user ID: %s", conversation.ID, userID)
@@ -124,9 +127,11 @@ func PushMessage(ctx context.Context, conversation utils.Conversation, message u
 		return utils.Conversation{}, false, err
 	}
 
-	// Async embedding for searchable messages
+	// Async embedding for searchable messages — serialized through the
+	// single embed worker (never a bare goroutine: N concurrent embeds
+	// on the SetMaxOpenConns(1) pool wedge the whole backend).
 	if message.Role == "user" || message.Role == "assistant" {
-		go search.EmbedMessage(db, LiteLLMBaseURL, msgID, message.TextContent())
+		search.EnqueueEmbed(db, LiteLLMBaseURL, "message", fmt.Sprintf("%d", msgID), message.TextContent())
 	}
 
 	// Reload the full conversation

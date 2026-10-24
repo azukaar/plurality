@@ -87,6 +87,18 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
   bool _closeMessageWarning = false;
   bool _didInitialScroll = false;
 
+  // Last ConversationState seen by _onSessionChanged. Used to rebuild the
+  // chat only on state transitions (stream start/end, tool-wait, error)
+  // instead of on every streaming token.
+  ConversationState _lastSessionState = ConversationState.idle;
+
+  // Last (state|activity|toolName) key and processing flag for THIS
+  // conversation from the global status stream. The status notifier fires on
+  // every status event for ANY conversation of the user; these track whether
+  // the open chat's own status actually changed before triggering a rebuild.
+  String _lastStatusKey = '';
+  bool _lastStatusProcessing = false;
+
   // Mirrors the main list's itemCount from the most recent buildMessageList.
   // jumpToItem callers must use this — recomputing a filter here drifts and
   // throws an out-of-bounds assertion in super_sliver_list.
@@ -192,12 +204,45 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
         _needsBottomMargin = false;
         _closeMessageWarning = false;
         _didInitialScroll = false;
+        // Reset the transition tracker to the newly-bound session's current
+        // state so the next real transition still triggers a rebuild.
+        _lastSessionState = _session.value.state;
+        // Reset status-trackers so the newly-selected conversation's current
+        // status (if any) triggers a rebuild on the next status event.
+        _lastStatusKey = '';
+        _lastStatusProcessing = false;
       });
     }
   }
 
+  /// Called when the global status stream changes. The stream fires for EVERY
+  /// conversation of this user (sub-agents, background tasks, other tabs) and
+  /// each event installs a NEW map on the shared ValueNotifier — so this
+  /// listener runs for all of them, not just this chat's. A full setState()
+  /// per event rebuilt the entire conversation (every DB message's markdown
+  /// + the minimap + composer) mid-typing whenever ANY other conversation
+  /// transitioned, which showed up as input lag and jank.
+  ///
+  /// Rebuild only when THIS conversation's status actually changed: the
+  /// (state|activity|toolName) key or the processing flag. Duplicate events
+  /// for this conversation (server re-broadcasts an unchanged typing status,
+  /// or a ModelSelected-only refresh with no status change) are filtered, and
+  /// events for other conversations no longer touch this widget. Real SSE
+  /// state flips are still handled by _onSessionChanged's transition guard.
   void _onStatusChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    final status =
+        _chatService.conversationStatuses.value[widget.conversationId];
+    final isProcessing = status?.isProcessing ?? false;
+    final statusKey = status == null
+        ? ''
+        : '${status.state}|${status.activity}|${status.toolName}';
+    final keyChanged = statusKey != _lastStatusKey;
+    final processingChanged = isProcessing != _lastStatusProcessing;
+    if (!keyChanged && !processingChanged) return;
+    _lastStatusKey = statusKey;
+    _lastStatusProcessing = isProcessing;
+    setState(() {});
   }
 
   /// Called whenever ChatService session state changes.
@@ -223,7 +268,18 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
       }
     }
 
-    setState(() {});
+    // The session notifier fires on EVERY SSE token while text streams. A
+    // full setState here would rebuild the entire chat — every rendered DB
+    // message (each an AnimatedMessageBox with a markdown subtree), the
+    // minimap, the composer — per token: O(history) markdown re-renders that
+    // showed up as GPU stalls and Firefox crashes. The streaming slot is
+    // wrapped in its own ValueListenableBuilder below and re-renders itself
+    // per token; this whole-chat rebuild only needs to happen on state
+    // transitions (stream start/end, tool-wait, error).
+    if (state.state != _lastSessionState || state.error != null) {
+      _lastSessionState = state.state;
+      setState(() {});
+    }
   }
 
   // Extract the model selection logic to a separate method
@@ -297,6 +353,9 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
     _inputFocusNode.dispose();
     // Guard: controller may already be disposed if widget was torn down during navigation
     try { _messageController.dispose(); } catch (_) {}
+    // Release the streaming session for this (now closed) conversation so its
+    // growing items list is freed. No-op for conversations with a live stream.
+    _chatService.disposeSession(widget.conversationId);
     super.dispose();
   }
 
@@ -335,8 +394,14 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
     if (!_listController.isAttached ||
         !_mainScrollController.hasClients ||
         _lastMainItemCount <= 0) return;
+    // Clamp to the item count of the most recent build. Streaming content can
+    // toggle itemCount between the build and this callback (e.g. a tool event
+    // landing while the one-shot initial-scroll frame is in flight): jumping
+    // to a stale index throws an out-of-bounds assertion in super_sliver_list
+    // and crashes the whole tab.
+    final targetIndex = (_lastMainItemCount - 1).clamp(0, _lastMainItemCount - 1);
     _listController.jumpToItem(
-      index: _lastMainItemCount - 1,
+      index: targetIndex,
       scrollController: _mainScrollController,
       alignment: 1.0,
     );
@@ -1037,12 +1102,20 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
       itemCount: itemCount,
       itemBuilder: (context, index) {
         // --- Streaming content ---
+        // Rebuild ONLY this item per SSE token. Previously the whole list
+        // (and the whole chat) rebuilt on every token via _onSessionChanged's
+        // unconditional setState — every DB message's markdown re-rendered
+        // per token (GPU stalls, jank). The slot below listens to _session
+        // itself and re-renders just this item when the streamed text grows.
         if (hasStreamingContent && index == visibleMessages.length) {
           return Align(
             alignment: Alignment.centerLeft,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: _buildStreamingWidgets(sessionState, messages, mini),
+            child: ValueListenableBuilder<ChatSessionState>(
+              valueListenable: _session,
+              builder: (context, s, _) => Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: _buildStreamingWidgets(s, messages, mini),
+              ),
             ),
           );
         }
@@ -1146,7 +1219,14 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
       });
     }
 
-    // Build main content and minimap content using the shared function
+    // MiniMap is only shown on wide non-web desktop layouts. On web
+    // (kIsWeb) it is never rendered — computing it doubles the per-build
+    // message-list cost (every message's markdown parsed a second time per
+    // frame, GPU/CanvasKit stalls). Declared before the content build below
+    // so the minimap list is skipped entirely when hidden.
+    final bool showMiniMap = !widget.isMobile && !kIsWeb && MediaQuery.of(context).size.width >= 1800;
+
+    // Build main content and (only when visible) the minimap content
     final mainContent = buildMessageList(
       messages: messages,
       controller: _mainScrollController,
@@ -1158,21 +1238,21 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
       ),
     );
 
-    final miniMapContent = buildMessageList(
-      messages: messages,
-      controller: _miniMapScrollController,
-      mini: true,
-      padding: EdgeInsets.only(
-        left: 4.0,
-        right: 4.0,
-        top: 4.0,
-        bottom: 0.0,
-      ),
-    );
+    final Widget? miniMapContent = showMiniMap
+        ? buildMessageList(
+            messages: messages,
+            controller: _miniMapScrollController,
+            mini: true,
+            padding: EdgeInsets.only(
+              left: 4.0,
+              right: 4.0,
+              top: 4.0,
+              bottom: 0.0,
+            ),
+          )
+        : null;
 
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-
-    final bool showMiniMap = !widget.isMobile && !kIsWeb && MediaQuery.of(context).size.width >= 1800;
 
     // Combine both scrolling methods
     Widget chatContent = MiddleClickScroller(
@@ -1465,7 +1545,7 @@ class _ChatInterfaceState extends ConsumerState<ChatInterface>
               enabled: true,
               mainScrollController: _mainScrollController,
               miniMapScrollController: _miniMapScrollController,
-              miniMapContent: miniMapContent,
+              miniMapContent: miniMapContent ?? const SizedBox.shrink(),
               overlayColor:
                   Theme.of(context).brightness == Brightness.dark
                       ? Theme.of(context).textTheme.bodySmall?.color ?? Colors.red

@@ -44,7 +44,7 @@ const vsTheme = {
   ), // Light blue selector attributes
   'selector-pseudo': TextStyle(
     color: Color(0xFFD7BA7D),
-  ), // Light brown pseudo selectors
+  ), // Light brown selector pseudo
   'meta': TextStyle(color: Color(0xFF569CD6)), // Blue meta
   'doctag': TextStyle(color: Color(0xFF608B4E)), // Dark green doc tags
   'attr': TextStyle(color: Color(0xFF9CDCFE)), // Light blue attributes
@@ -86,6 +86,12 @@ class _AnimatedMessageBoxState extends State<AnimatedMessageBox>
   late StreamSubscription<bool> _speakingSubscription;
   bool _isSpeaking = false;
 
+  // Only the currently-streaming bot message should pulse its border. Starting
+  // the repeat unconditionally kept every finished message animating forever
+  // at 60fps, re-laying-out the whole markdown subtree each frame (CanvasKit =
+  // WebGL GPU work, ReadPixels stalls, OOM in Firefox).
+  bool get _shouldAnimate => widget.isLoading && widget.isBot;
+
   @override
   void initState() {
     super.initState();
@@ -93,7 +99,10 @@ class _AnimatedMessageBoxState extends State<AnimatedMessageBox>
     _animationController = AnimationController(
       duration: const Duration(seconds: 1),
       vsync: this,
-    )..repeat(reverse: true);
+    );
+    if (_shouldAnimate) {
+      _animationController.repeat(reverse: true);
+    }
 
     _ttsService.initialize();
 
@@ -117,7 +126,14 @@ class _AnimatedMessageBoxState extends State<AnimatedMessageBox>
   void didUpdateWidget(AnimatedMessageBox oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    if (!(widget.isLoading && widget.isBot)) {
+    // Start the pulse when a message starts streaming, stop it when it
+    // finishes (previous code only stopped, leaving finished bubbles
+    // animating forever).
+    if (_shouldAnimate) {
+      if (!_animationController.isAnimating) {
+        _animationController.repeat(reverse: true);
+      }
+    } else {
       _animationController.stop();
     }
   }
@@ -137,6 +153,118 @@ class _AnimatedMessageBoxState extends State<AnimatedMessageBox>
     _animationController.dispose();
     _speakingSubscription.cancel();
     super.dispose();
+  }
+
+  /// The heavy markdown subtree. Built once per widget build and handed to
+  /// AnimatedBuilder as its `child`, so per-frame ticks never re-layout it.
+  Widget _buildMessageContent({
+    required bool isDark,
+    required Color botBG,
+    required Color botFG,
+    required Color userBG,
+  }) {
+    return SelectionArea(
+      child: MarkdownBody(
+        softLineBreak: true,
+        onTapLink: (text, url, title) {
+          if (url == null) return;
+
+          if (url.startsWith('plurality://conversation/')) {
+            final convId = url.replaceFirst('plurality://conversation/', '');
+            if (widget.onConversationTap != null) {
+              widget.onConversationTap!(convId);
+            }
+          } else if (url.startsWith('http')) {
+            launchUrl(
+              Uri.parse(url ?? ''),
+              mode: LaunchMode.externalApplication,
+            );
+          } else {
+            Clipboard.setData(ClipboardData(text: url));
+          }
+        },
+        builders: {
+          'code': CodeElementBuilder(
+            widget.isBot,
+            isDark,
+            mini: widget.mini,
+          ),
+        },
+        data: widget.text,
+        styleSheet: MarkdownStyleSheet(
+          p: TextStyle(
+            color: widget.isBot ? botFG : Colors.white,
+            fontSize: widget.mini ? 3 : 16,
+            height: widget.mini ? 1.0 : 1.5,
+          ),
+          pPadding: EdgeInsets.only(bottom: widget.mini ? 0 : 6),
+          h1: TextStyle(fontSize: widget.mini ? 6 : 24),
+          h1Padding: EdgeInsets.only(top: widget.mini ? 0 : 18, bottom: widget.mini ? 0 : 8),
+          h2: TextStyle(fontSize: widget.mini ? 5 : 20),
+          h2Padding: EdgeInsets.only(top: widget.mini ? 0 : 16, bottom: widget.mini ? 0 : 6),
+          h3: TextStyle(fontSize: widget.mini ? 4 : 18),
+          h3Padding: EdgeInsets.only(top: widget.mini ? 0 : 14, bottom: widget.mini ? 0 : 6),
+          h4: TextStyle(fontSize: widget.mini ? 4 : 16),
+          h5: TextStyle(fontSize: widget.mini ? 4 : 14),
+          h6: TextStyle(fontSize: widget.mini ? 4 : 12),
+          blockquote: TextStyle(
+            color: (widget.isBot ? botFG : Colors.white).withOpacity(0.75),
+            fontSize: widget.mini ? 3 : 16,
+            height: widget.mini ? 1.0 : 1.5,
+            fontStyle: FontStyle.italic,
+          ),
+          listBullet: TextStyle(fontSize: widget.mini ? 3 : 16),
+          blockquotePadding: EdgeInsets.only(
+            left: widget.mini ? 4 : 12,
+            right: widget.mini ? 2 : 8,
+            top: widget.mini ? 1 : 4,
+            bottom: widget.mini ? 1 : 4,
+          ),
+          blockquoteDecoration: BoxDecoration(
+            color: (widget.isBot ? botFG : Colors.white).withOpacity(0.06),
+            border: Border(
+              left: BorderSide(
+                color: (widget.isBot ? botFG : Colors.white).withOpacity(0.35),
+                width: widget.mini ? 1 : 3,
+              ),
+            ),
+            borderRadius: BorderRadius.circular(widget.mini ? 1 : 4),
+          ),
+          listBulletPadding: EdgeInsets.only(
+            left: widget.mini ? 0 : (MediaQuery.of(context).size.width >= 600 ? 8 : 2),
+            right: widget.mini ? 0 : (MediaQuery.of(context).size.width >= 600 ? 8 : 4),
+            top: 0,
+            bottom: 0,
+          ),
+          listIndent: widget.mini ? 1 : (MediaQuery.of(context).size.width >= 600 ? 24 : 12),
+          codeblockPadding: EdgeInsets.symmetric(vertical: widget.mini ? 0 : 8),
+          tableHead: TextStyle(fontSize: widget.mini ? 3 : 16),
+          tableBody: TextStyle(fontSize: widget.mini ? 3 : 16),
+          tablePadding: EdgeInsets.symmetric(
+            horizontal: widget.mini ? 0 : 8,
+            vertical: widget.mini ? 0 : 16,
+          ),
+          tableCellsPadding: EdgeInsets.symmetric(
+            horizontal: widget.mini ? 2 : 8,
+            vertical: widget.mini ? 1 : 8,
+          ),
+          horizontalRuleDecoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(color: Colors.transparent, width: widget.mini ? 0 : 12),
+              bottom: BorderSide(
+                color: (widget.isBot ? botFG : Colors.white).withOpacity(0.2),
+                width: 1,
+              ),
+            ),
+          ),
+          blockSpacing: widget.mini ? 0 : 16,
+          codeblockDecoration: BoxDecoration(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(0),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -161,156 +289,67 @@ class _AnimatedMessageBoxState extends State<AnimatedMessageBox>
       // Add the TTS functionality to the MessageToolbar
       ttsCallback: _isSpeaking ? stop : speak,
       isSpeaking: _isSpeaking,
+      // The markdown body is built once per widget build and reused as the
+      // AnimatedBuilder child, so animation ticks only rebuild the lightweight
+      // border Container. RepaintBoundary keeps the 60fps border pulse from
+      // re-rasterizing the markdown layer on CanvasKit/WebGL.
       child: AnimatedBuilder(
         animation: _animationController,
+        child: _buildMessageContent(
+          isDark: isDark,
+          botBG: botBG,
+          botFG: botFG,
+          userBG: userBG,
+        ),
         builder: (context, child) {
-          return Stack(
-            children: [
-              Container(
-                margin: EdgeInsets.only(
-                  left: widget.isBot ? 0 : 32.0,
-                  right: widget.isBot ? 32.0 : 8.0,
-                  top: 4.0,
-                  bottom: 4.0,
-                ),
-                padding: EdgeInsets.symmetric(
-                  vertical: widget.mini ? 1.0 : (MediaQuery.of(context).size.width >= 600 ? 16.0 : 16.0),
-                  horizontal: widget.mini ? 1.0 : (MediaQuery.of(context).size.width >= 600 ? 24.0 : 16.0),
-                ),
-                decoration: BoxDecoration(
-                  color: widget.isBot ? botBG : userBG,
-                  borderRadius:
-                      widget.mini
-                          ? BorderRadius.circular(2.0)
-                          : BorderRadius.circular(12.0),
-                  border:
-                      widget.isLoading && widget.isBot
-                          ? Border.all(
-                            width: 2,
-                            style: BorderStyle.solid,
-                            color:
-                                Color.lerp(
-                                  Color(0xffee4654),
-                                  Color(0xfff5c256),
-                                  _animationController.value,
-                                )!,
-                          )
-                          : null,
-                  boxShadow:
-                      widget.mini
-                          ? [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.1),
-                              blurRadius: 4,
-                              offset: const Offset(0, 2),
-                            ),
-                          ]
-                          : null,
-                ),
-                child: SelectionArea(
-                  child: MarkdownBody(
-                    softLineBreak: true,
-                    onTapLink: (text, url, title) {
-                      if (url == null) return;
-
-                      if (url.startsWith('plurality://conversation/')) {
-                        final convId = url.replaceFirst('plurality://conversation/', '');
-                        if (widget.onConversationTap != null) {
-                          widget.onConversationTap!(convId);
-                        }
-                      } else if (url.startsWith('http')) {
-                        launchUrl(
-                          Uri.parse(url ?? ''),
-                          mode: LaunchMode.externalApplication,
-                        );
-                      } else {
-                        Clipboard.setData(ClipboardData(text: url));
-                      }
-                    },
-                    builders: {
-                      'code': CodeElementBuilder(
-                        widget.isBot,
-                        isDark,
-                        mini: widget.mini,
-                      ),
-                    },
-                    data: widget.text,
-                    styleSheet: MarkdownStyleSheet(
-                      p: TextStyle(
-                        color: widget.isBot ? botFG : Colors.white,
-                        fontSize: widget.mini ? 3 : 16,
-                        height: widget.mini ? 1.0 : 1.5,
-                      ),
-                      pPadding: EdgeInsets.only(bottom: widget.mini ? 0 : 6),
-                      h1: TextStyle(fontSize: widget.mini ? 6 : 24),
-                      h1Padding: EdgeInsets.only(top: widget.mini ? 0 : 18, bottom: widget.mini ? 0 : 8),
-                      h2: TextStyle(fontSize: widget.mini ? 5 : 20),
-                      h2Padding: EdgeInsets.only(top: widget.mini ? 0 : 16, bottom: widget.mini ? 0 : 6),
-                      h3: TextStyle(fontSize: widget.mini ? 4 : 18),
-                      h3Padding: EdgeInsets.only(top: widget.mini ? 0 : 14, bottom: widget.mini ? 0 : 6),
-                      h4: TextStyle(fontSize: widget.mini ? 4 : 16),
-                      h5: TextStyle(fontSize: widget.mini ? 4 : 14),
-                      h6: TextStyle(fontSize: widget.mini ? 4 : 12),
-                      blockquote: TextStyle(
-                        color: (widget.isBot ? botFG : Colors.white).withOpacity(0.75),
-                        fontSize: widget.mini ? 3 : 16,
-                        height: widget.mini ? 1.0 : 1.5,
-                        fontStyle: FontStyle.italic,
-                      ),
-                      listBullet: TextStyle(fontSize: widget.mini ? 3 : 16),
-                      blockquotePadding: EdgeInsets.only(
-                        left: widget.mini ? 4 : 12,
-                        right: widget.mini ? 2 : 8,
-                        top: widget.mini ? 1 : 4,
-                        bottom: widget.mini ? 1 : 4,
-                      ),
-                      blockquoteDecoration: BoxDecoration(
-                        color: (widget.isBot ? botFG : Colors.white).withOpacity(0.06),
-                        border: Border(
-                          left: BorderSide(
-                            color: (widget.isBot ? botFG : Colors.white).withOpacity(0.35),
-                            width: widget.mini ? 1 : 3,
-                          ),
-                        ),
-                        borderRadius: BorderRadius.circular(widget.mini ? 1 : 4),
-                      ),
-                      listBulletPadding: EdgeInsets.only(
-                        left: widget.mini ? 0 : (MediaQuery.of(context).size.width >= 600 ? 8 : 2),
-                        right: widget.mini ? 0 : (MediaQuery.of(context).size.width >= 600 ? 8 : 4),
-                        top: 0,
-                        bottom: 0,
-                      ),
-                      listIndent: widget.mini ? 1 : (MediaQuery.of(context).size.width >= 600 ? 24 : 12),
-                      codeblockPadding: EdgeInsets.symmetric(vertical: widget.mini ? 0 : 8),
-                      tableHead: TextStyle(fontSize: widget.mini ? 3 : 16),
-                      tableBody: TextStyle(fontSize: widget.mini ? 3 : 16),
-                      tablePadding: EdgeInsets.symmetric(
-                        horizontal: widget.mini ? 0 : 8,
-                        vertical: widget.mini ? 0 : 16,
-                      ),
-                      tableCellsPadding: EdgeInsets.symmetric(
-                        horizontal: widget.mini ? 2 : 8,
-                        vertical: widget.mini ? 1 : 8,
-                      ),
-                      horizontalRuleDecoration: BoxDecoration(
-                        border: Border(
-                          top: BorderSide(color: Colors.transparent, width: widget.mini ? 0 : 12),
-                          bottom: BorderSide(
-                            color: (widget.isBot ? botFG : Colors.white).withOpacity(0.2),
-                            width: 1,
-                          ),
-                        ),
-                      ),
-                      blockSpacing: widget.mini ? 0 : 16,
-                      codeblockDecoration: BoxDecoration(
-                        color: Colors.transparent,
-                        borderRadius: BorderRadius.circular(0),
-                      ),
-                    ),
+          return RepaintBoundary(
+            child: Stack(
+              children: [
+                Container(
+                  margin: EdgeInsets.only(
+                    left: widget.isBot ? 0 : 32.0,
+                    right: widget.isBot ? 32.0 : 8.0,
+                    top: 4.0,
+                    bottom: 4.0,
                   ),
+                  padding: EdgeInsets.symmetric(
+                    vertical: widget.mini ? 1.0 : (MediaQuery.of(context).size.width >= 600 ? 16.0 : 16.0),
+                    horizontal: widget.mini ? 1.0 : (MediaQuery.of(context).size.width >= 600 ? 24.0 : 16.0),
+                  ),
+                  decoration: BoxDecoration(
+                    color: widget.isBot ? botBG : userBG,
+                    borderRadius:
+                        widget.mini
+                            ? BorderRadius.circular(2.0)
+                            : BorderRadius.circular(12.0),
+                    border:
+                        widget.isLoading && widget.isBot
+                            ? Border.all(
+                              width: 2,
+                              style: BorderStyle.solid,
+                              color:
+                                  Color.lerp(
+                                    Color(0xffee4654),
+                                    Color(0xfff5c256),
+                                    _animationController.value,
+                                  )!,
+                            )
+                            : null,
+                    boxShadow:
+                        widget.mini
+                            ? [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.1),
+                                blurRadius: 4,
+                                offset: const Offset(0, 2),
+                              ),
+                            ]
+                            : null,
+                  ),
+                  child: RepaintBoundary(child: child!),
                 ),
-              ),
-            ],
+              ],
+            ),
           );
         },
       ),

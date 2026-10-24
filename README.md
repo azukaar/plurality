@@ -153,13 +153,13 @@ docker run -d --name plurality \
   -e OPENROUTER_API_KEY=xxxxx \
   -e INIT_ADMIN_USER=admin \
   -e INIT_ADMIN_PASSWORD=change-me \
-  azukaar/plurality
+  ghcr.io/aseracorp/plurality
 ```
 
 ```yml
 services:
   plurality2:
-    image: azukaar/plurality
+    image: ghcr.io/aseracorp/plurality
     container_name: plurality2
     ports:
       - "8090:8090"

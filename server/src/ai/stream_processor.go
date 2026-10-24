@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -32,7 +33,12 @@ func NewStreamProcessor(request *ActiveRequest, model utils.Model, conversation 
 
 // broadcastText sends a text chunk to all SSE clients and accumulates it in the buffer.
 func (sp *StreamProcessor) broadcastText(content string) {
-	if content == "" {
+	if strings.TrimSpace(content) == "" {
+		// Whitespace-only chunk: skip the SSE broadcast AND the buffer. Without
+		// this check, a model that emits leading newline(s) before its first
+		// token (common with DeepSeek over OpenRouter) would render an empty
+		// "assistant" bubble on the client and persist whitespace-only text
+		// that then re-enters history on every turn.
 		return
 	}
 	sp.request.TextBuffer.WriteString(content)
@@ -67,6 +73,24 @@ func (sp *StreamProcessor) accumulateToolCall(id, name, arguments string) {
 	}
 }
 
+// mintProviderCallID makes an assistant tool-call id unique across the WHOLE
+// conversation, not just this turn. Providers (e.g. DeepSeek v4 Flash over
+// OpenRouter) recycle short ids like "call_0" on every turn, so an id that was
+// already persisted in an earlier assistant message collides with later turns.
+// Namespacing on the number of already-persisted messages guarantees two tool
+// calls can never share an id (even the same provider id twice in one turn),
+// while staying short and deterministic.
+func (sp *StreamProcessor) mintProviderCallID(providerID string) string {
+	// One namespace per persisted message: len() is the number of messages
+	// already persisted, and each new assistant message appends to the array,
+	// so the namespace strictly increases turn over turn.
+	ns := len(sp.conversation.Messages) + 1000
+	if providerID == "" {
+		return fmt.Sprintf("call_%d_a", ns)
+	}
+	return fmt.Sprintf("call_%d_%s", ns, providerID)
+}
+
 // buildAssistantMessage creates the final assistant Message from accumulated buffers.
 func (sp *StreamProcessor) buildAssistantMessage() utils.Message {
 	message := utils.Message{
@@ -79,13 +103,18 @@ func (sp *StreamProcessor) buildAssistantMessage() utils.Message {
 		Model:            sp.model,
 	}
 
-	text := sp.request.TextBuffer.String()
+	text := strings.TrimSpace(sp.request.TextBuffer.String())
 	if text != "" {
 		message.Content = utils.NewTextContent(text)
 	}
 
 	if len(sp.request.ToolCallBuffer) > 0 {
 		for i := range sp.request.ToolCallBuffer {
+			// Namespace the provider id with this conversation's seq so ids
+			// are unique across turns (providers reuse call_0) — the persisted
+			// assistant message and every result pushed for it must carry the
+			// same minted id, otherwise the tool loop cannot match them.
+			sp.request.ToolCallBuffer[i].ID = sp.mintProviderCallID(sp.request.ToolCallBuffer[i].ID)
 			enrichToolCallMetadata(&sp.request.ToolCallBuffer[i])
 		}
 		message.ToolCalls = sp.request.ToolCallBuffer
@@ -163,10 +192,14 @@ func (sp *StreamProcessor) finalizeStream(ctx context.Context) utils.Message {
 }
 
 // ProcessStandardStream reads an OpenAI-compatible SSE stream from the LiteLLM proxy.
+// The response is wrapped in an idleTimeoutReader so a provider that accepted the
+// request (200 OK) but then stops sending bytes cannot wedge this goroutine
+// forever inside bufio.Scanner.Scan (the recurring "conversation ends but the
+// workflow never completes" stall, previously stuck 80-200 min per crash dump).
 func (sp *StreamProcessor) ProcessStandardStream(ctx context.Context, response io.ReadCloser) (utils.Message, error) {
 	defer response.Close()
 
-	scanner := bufio.NewScanner(response)
+	scanner := bufio.NewScanner(&idleTimeoutReader{ctx: ctx, r: response, timeout: 90 * time.Second})
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -215,5 +248,49 @@ func (sp *StreamProcessor) ProcessStandardStream(ctx context.Context, response i
 		}
 	}
 
-	return sp.buildAssistantMessage(), scanner.Err()
+	if err := scanner.Err(); err != nil {
+		// A bounded idle-timeout error (see idleTimeoutReader) must NOT be
+		// treated as a clean end-of-stream: the response was incomplete. Return
+		// it so RunLLMLoop marks the turn as errored (state idle + error event)
+		// instead of finalizing a truncated / empty "done".
+		return sp.buildAssistantMessage(), err
+	}
+	return sp.buildAssistantMessage(), nil
+}
+
+// idleTimeoutReader wraps an io.Reader so every Read gives up if no byte arrives
+// within timeout. This bounds the time a RunLLMLoop goroutine can block reading
+// a stalled SSE stream (see ProcessStandardStream), preventing the multi-hour
+// wedges observed in crash dumps (goroutines stuck in Scanner.Scan / chunked
+// reader poll wait holding the ActiveRequest and the single SQLite connection).
+//
+// Unlike the pre-#36 version it also watches the run context: when the request
+// is cancelled (user stop / client disconnect) the reader unblocks immediately
+// instead of waiting out the full timeout.
+type idleTimeoutReader struct {
+	ctx     context.Context
+	r       io.Reader
+	timeout time.Duration
+}
+
+func (t *idleTimeoutReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := t.r.Read(p)
+		ch <- result{n, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-time.After(t.timeout):
+		err := fmt.Errorf("SSE stream idle timeout after %v (no bytes received)", t.timeout)
+		utils.Error("[StreamProcessor] %v", err)
+		return 0, err
+	case <-t.ctx.Done():
+		return 0, t.ctx.Err()
+	}
 }
